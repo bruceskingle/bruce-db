@@ -337,6 +337,28 @@ versions, and a git-ignored `.cargo/config.toml` patches them to the local check
 Likely dependencies: `serde_json_canonicalizer` for RFC 8785, `unicode-normalization` for NFC, `sha2`, `base64`, and
 `uuid` with its `v1` feature, which takes the node from the caller.
 
+### Space used
+
+As more is collected, a device's card fills, so a node says how much space each kind of data takes, as a tree which
+follows the hash keys: the site, then each kind, e.g. `tesla.snapshot`, then each part of its hash keys, e.g. a gateway
+DIN, then the days of a series, each level the total of those under it, so that the breakdown can be seen at any of
+them, e.g. on the app's Devices page, and what to clear can be chosen, e.g. a kind's oldest days.
+
+The parts of a hash key are already the directories, see above, so the tree is the directory tree, and the space is
+its files' sizes, by scanning or by keeping running totals:
+
+- **Scanning** is simple and never wrong, but on a card with years of a file a day it means reading the size of
+  thousands of files, which on FAT over SD on an ESP32 may take seconds to minutes, so it could not be asked for often.
+- **Running totals** are cheap to read but must be kept right through every append, compaction and deletion, and
+  through a crash in between.
+- **Between the two**, which may be enough: compaction knows the size of each file it writes, so it records each
+  DataSet's total, e.g. as a `#space` record in the DataSet, see [Flavours](#flavours-from-the-sort-key), which
+  replicates with it, and the journal days not yet compacted are added by their own sizes, a few files at most. Then a
+  breakdown is a read of a record per DataSet, summed up the tree, and a full scan is only needed to check it.
+
+Which is enough depends on how large a store gets, which the temperature log, see [Migration](#migration-and-open-questions),
+will start to show.
+
 ## Migration and open questions
 
 Build the crate, then move the temperature log onto it end to end, then the other stores one at a time, with
@@ -364,4 +386,6 @@ Open questions:
 - [x] The crate: its own repository, published to crates.io as `bruce-db` (settled).
 - [ ] Re-rated final slots: fetch the last few weeks of them again now and then, now that a new version simply
   replaces the old?
+- [ ] The space used, see [Space used](#space-used): scanned, running totals, or totals kept by compaction? And what a
+  node does as its card fills, e.g. drop a kind's oldest days which have been replicated elsewhere?
 - [ ] Which of today's IDs are hashed: account and meter numbers certainly; Tesla DINs and zappi serials too?

@@ -77,6 +77,13 @@ Rules:
 4. **Deletes are rare**, and a tombstone, a version with no attributes, so that a peer which still has the record
    learns it is gone.
 
+**Best practice for callers, not a rule of the store:** the store does not know which records are a source's data and
+which were worked out; the app does. It is best to keep what a source sent, an API's reply or a device's record, as it
+sent it, and anything computed from it, e.g. units from a cost and a rate, a total, a fitted rate, in DataSets of
+their own kinds, read alongside, if it is worth keeping at all. Then what was given can always be told from what was
+worked out, and the worked out can be thrown away and computed again. Marco Sparko's Octopus meter readings cache
+mixed them, and lost which figures Octopus gave.
+
 The sort key is what earns its place: "a day of temperature" becomes a range on it, compaction keeps one line for
 each, and a record's file is chosen from it, not from when it happened to arrive.
 

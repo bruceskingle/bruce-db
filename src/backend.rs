@@ -43,7 +43,35 @@ pub struct Change {
     pub from: Option<String>,
 }
 
+impl Change {
+    /// The change as a journal's line is, `{"n","t","from","o","hk","sk","v","a"}`, which is how a node's feed gives
+    /// it to a peer, e.g. a capture device's `/api/store/changes`, so that the feed and the files have one format.
+    pub fn to_json(&self) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::to_value(crate::item::Line::new(
+            &self.item,
+            self.sequence,
+            self.stored,
+            self.from.as_deref(),
+        ))?)
+    }
+
+    /// A change given by a peer's feed, see to_json.
+    pub fn from_json(json: serde_json::Value) -> anyhow::Result<Change> {
+        let line: crate::item::Line = serde_json::from_value(json)?;
+        Ok(Change {
+            item: line.item()?,
+            sequence: line.n,
+            stored: line.stored()?,
+            from: line.from.clone(),
+        })
+    }
+}
+
 pub trait Backend: Send + Sync {
+    /// The store's ID, made when it was first made, which a peer keeps with its cursor, see changes, so that it can
+    /// tell when a node's store is a new one, e.g. a device's wiped or changed card, whose sequence numbers start again.
+    fn store_id(&self) -> String;
+
     /// Stores item unless a copy as new is stored, saying which happened. from is the peer it was pulled from, None
     /// if it is put here.
     fn put(&self, item: &Item, from: Option<&str>) -> anyhow::Result<Put>;

@@ -2,14 +2,14 @@
 //! 43 characters, and in hex, 64 characters, in file names, see the design's IDs.
 //!
 //! What an ID is made from must follow the design's rules, which are enforced here: no arrays, numbers which are exact
-//! as IEEE doubles, and strings normalised to Unicode NFC. Normalising needs Unicode's tables, which are not in the
-//! crate yet, so for now a string must be ASCII, which is always NFC, and any other is refused rather than hashed
-//! unnormalised.
+//! as IEEE doubles, and strings, and the names of fields, normalised to Unicode NFC, so that the same text typed as
+//! different code points, e.g. é as one, or as e and a combining accent, gives the same ID.
 
 use anyhow::{anyhow, bail};
 use base64::Engine;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
 
 /// The largest integer every IEEE double holds exactly, 2^53.
 const MAX_EXACT: f64 = 9_007_199_254_740_992.0;
@@ -22,8 +22,8 @@ impl Id {
     /// The ID of value, which must follow the rules, see check.
     pub fn of(value: &Value) -> anyhow::Result<Id> {
         check(value, "")?;
-        let canonical =
-            serde_jcs::to_string(value).map_err(|error| anyhow!("Unable to make canonical JSON, {error}"))?;
+        let canonical = serde_jcs::to_string(&normalise(value, "")?)
+            .map_err(|error| anyhow!("Unable to make canonical JSON, {error}"))?;
         Ok(Id::of_bytes(canonical.as_bytes()))
     }
 
@@ -92,12 +92,11 @@ fn check(value: &Value, path: &str) -> anyhow::Result<()> {
         ),
         Value::Object(fields) => {
             for (name, field) in fields {
-                check_string(name, path)?;
                 check(field, &format!("{path}/{name}"))?;
             }
             Ok(())
         }
-        Value::String(text) => check_string(text, path),
+        Value::String(_) => Ok(()),
         Value::Number(number) => {
             let exact = match (number.as_i64(), number.as_u64(), number.as_f64()) {
                 // Compared as integers, as converting one past the limit to a double rounds it down to the limit.
@@ -117,14 +116,27 @@ fn check(value: &Value, path: &str) -> anyhow::Result<()> {
     }
 }
 
-/// See the module documentation: only ASCII until strings can be normalised to NFC.
-fn check_string(text: &str, path: &str) -> anyhow::Result<()> {
-    if !text.is_ascii() {
-        bail!(
-            "An ID can not yet be made from text which is not ASCII, at {path}, as it can not be normalised to NFC yet"
-        );
-    }
-    Ok(())
+/// value with its strings and the names of its fields normalised to NFC, see the module documentation, refusing an
+/// object two of whose names are the same once normalised, at path, rather than keeping one of them.
+fn normalise(value: &Value, path: &str) -> anyhow::Result<Value> {
+    Ok(match value {
+        Value::Object(fields) => {
+            let mut normalised = serde_json::Map::new();
+            for (name, field) in fields {
+                let name: String = name.nfc().collect();
+                let field = normalise(field, &format!("{path}/{name}"))?;
+                if normalised.insert(name.clone(), field).is_some() {
+                    bail!(
+                        "An ID can not be made from two fields named {name}, at {}, once normalised to NFC",
+                        if path.is_empty() { "the top" } else { path }
+                    );
+                }
+            }
+            Value::Object(normalised)
+        }
+        Value::String(text) => Value::String(text.nfc().collect()),
+        other => other.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -156,10 +168,32 @@ mod tests {
     }
 
     #[test]
-    fn arrays_inexact_numbers_and_text_not_yet_normalised_are_refused() {
+    fn arrays_and_inexact_numbers_are_refused() {
         assert!(Id::of(&json!({"a": [1, 2]})).is_err());
         assert!(Id::of(&json!({"a": 9_007_199_254_740_993u64})).is_err());
-        assert!(Id::of(&json!({"name": "Zoë"})).is_err());
         assert!(Id::of(&json!({"a": 1.5, "b": true, "c": null})).is_ok());
+    }
+
+    #[test]
+    fn text_typed_as_different_code_points_gives_the_same_id() {
+        // é as one code point, U+00E9, and as e and a combining acute accent, U+0301.
+        let composed = Id::of(&json!({"name": "Zo\u{e9}", "caf\u{e9}": 1})).unwrap();
+        let decomposed = Id::of(&json!({"name": "Zoe\u{301}", "cafe\u{301}": 1})).unwrap();
+        assert_eq!(composed, decomposed);
+        assert_ne!(composed, Id::of(&json!({"name": "Zoe", "cafe": 1})).unwrap());
+        // Its canonical JSON is the NFC.
+        let expected: String = Sha256::digest("{\"caf\u{e9}\":1,\"name\":\"Zo\u{e9}\"}".as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(composed.hex(), expected);
+    }
+
+    #[test]
+    fn two_names_which_are_one_once_normalised_are_refused() {
+        let mut fields = serde_json::Map::new();
+        fields.insert("caf\u{e9}".to_string(), json!(1));
+        fields.insert("cafe\u{301}".to_string(), json!(2));
+        assert!(Id::of(&Value::Object(fields)).is_err());
     }
 }

@@ -436,3 +436,134 @@ fn a_copied_site_has_the_same_records_under_its_own_hash_keys() {
     );
     assert_eq!(store.all(&hk).unwrap().len(), 2, "the original is as it was");
 }
+
+#[test]
+fn a_query_merges_records_whose_sort_keys_are_not_dates_between_the_days() {
+    let dir = TestDir::new("interleaved");
+    let store = open(&dir);
+    let hk = store.hash_key("octopus.consumption", &[]).unwrap();
+    for (sk, seconds) in [
+        ("2026-10-31T23:30:00Z", 1),
+        ("2026-11", 2),
+        ("2026-11-01T00:00:00Z", 3),
+        ("#fetched/2026-11", 4),
+    ] {
+        store
+            .put(&Item::new(&hk, sk, version(seconds, "app"), json!({"sk": sk})))
+            .unwrap();
+    }
+    let order = |store: &Store| -> Vec<String> { store.all(&hk).unwrap().into_iter().map(|item| item.sk).collect() };
+    let expected = vec![
+        "#fetched/2026-11",
+        "2026-10-31T23:30:00Z",
+        "2026-11",
+        "2026-11-01T00:00:00Z",
+    ];
+    assert_eq!(order(&store), expected);
+    store
+        .compact(Micros::now().date().unwrap().next_day().unwrap())
+        .unwrap();
+    assert_eq!(
+        order(&store),
+        expected,
+        "from records.jsonl and the day files, in order"
+    );
+    // A newer version in the journal of one in the middle, and a query stopped part way.
+    store
+        .put(&Item::new(&hk, "2026-11", version(9, "app"), json!({"sk": "newer"})))
+        .unwrap();
+    assert_eq!(order(&store), expected);
+    assert_eq!(
+        store.get(&hk, "2026-11").unwrap().unwrap().attributes,
+        Some(json!({"sk": "newer"}))
+    );
+    let mut first_two = Vec::new();
+    store
+        .query(&hk, ALL, &mut |item| {
+            first_two.push(item.sk);
+            Ok(if first_two.len() == 2 {
+                Flow::Stop
+            } else {
+                Flow::Continue
+            })
+        })
+        .unwrap();
+    assert_eq!(first_two, expected[..2]);
+}
+
+#[test]
+fn changes_page_one_at_a_time_through_compacted_files_and_the_journal() {
+    let dir = TestDir::new("paging");
+    let store = open(&dir);
+    let hk = store.hash_key("tesla.snapshot", &[Part::from("gw")]).unwrap();
+    let put = |store: &Store, sk: &str, seconds: i64| {
+        store
+            .put(&Item::new(&hk, sk, version(seconds, "dev1"), json!({"s": seconds})))
+            .unwrap();
+    };
+    put(&store, "2026-11-01T00:00:00Z", 1);
+    put(&store, "2026-11-02T00:00:00Z", 2);
+    put(&store, "-", 3);
+    store
+        .compact(Micros::now().date().unwrap().next_day().unwrap())
+        .unwrap();
+    put(&store, "2026-11-03T00:00:00Z", 4);
+    // A newer version of a compacted record, which is given as well.
+    put(&store, "2026-11-01T00:00:00Z", 5);
+    let mut found = Vec::new();
+    let mut cursor = Cursor::START;
+    loop {
+        let next = store
+            .changes(cursor, 1, None, &mut |change| {
+                found.push((change.sequence, change.item.attributes.unwrap()["s"].as_i64().unwrap()));
+                Ok(())
+            })
+            .unwrap();
+        if next == cursor {
+            break;
+        }
+        cursor = next;
+    }
+    assert_eq!(
+        found,
+        vec![(1, 1), (2, 2), (3, 3), (4, 4), (5, 5)],
+        "the first's compacted version is given before it was superseded, and its newer one after"
+    );
+}
+
+#[test]
+fn a_store_keeps_its_id_and_a_copy_has_its_own() {
+    let dir = TestDir::new("store-id");
+    let id = open(&dir).store_id();
+    assert!(is_id(&id));
+    assert_eq!(open(&dir).store_id(), id, "kept when opened again");
+    let copy = Id::of(&json!({"site": "copy"})).unwrap();
+    Store::copy_site(&dir.location(), &site(), &copy).unwrap();
+    let copied = Store::open(&dir.location(), &copy).unwrap().store_id();
+    assert!(is_id(&copied));
+    assert_ne!(copied, id);
+}
+
+#[test]
+fn a_change_goes_over_the_feed_as_a_line_and_comes_back_the_same() {
+    let dir = TestDir::new("wire");
+    let store = open(&dir);
+    let hk = store.hash_key("tesla.snapshot", &[Part::from("gateway")]).unwrap();
+    store
+        .put_from(
+            &Item::new(&hk, "2026-11-04T00:00:00Z", version(1, "dev1"), json!({"s": 1})),
+            "dev1",
+        )
+        .unwrap();
+    let mut changes = Vec::new();
+    store
+        .changes(Cursor::START, 10, None, &mut |change| {
+            changes.push(change);
+            Ok(())
+        })
+        .unwrap();
+    let json = changes[0].to_json().unwrap();
+    assert_eq!(json["hk"], json!(hk));
+    assert_eq!(json["from"], json!("dev1"));
+    assert_eq!(Change::from_json(json).unwrap(), changes[0]);
+}

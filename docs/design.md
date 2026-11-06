@@ -412,6 +412,88 @@ Made before the crate was built, with the move of Marco Sparko's stores onto it:
 - **The app reads only the store.** A build of the app before the store was kept as a snapshot, so the app does not
   read both a device's old API and the store's feed: a device not yet moved to the store is not read until it is.
 
+## Capture devices on the store
+
+Planned on 6 November 2026, with Bruce's choices: a device keeps the whole store now, not an append-only journal for a
+start, and converts the records it kept before on the device itself.
+
+- **A device writes the items the app writes now**, when it reads that device's records: the same kind, hash key,
+  sort key, version, the slot's second with the device's MAC as origin, and attributes, the record as the device makes
+  it now. It works out hashed IDs, e.g. `{"octopus": <account>}`, with this crate's `Id`. The kinds and the code which
+  builds their keys are in one file, shared by the app and the firmware, so that the two cannot drift.
+- **The app replicates; its modules no longer read devices.** One replicator in the app pulls each device's
+  `GET /api/store/changes?since=<n>&limit=500`, signed as reads are now, and puts each item with `from` the device,
+  in place of each module's own reading of `/api/capture/<module>/records`, which goes. Its cursor for each device is
+  a record of the app's, `app.replication/<app node>/<device>`.
+- **A store has an ID of its own**, made when it is first made and kept in `state.json`, which the feed gives with
+  each page, so that when a card is wiped or changed and the device's sequence numbers start again, a peer starts
+  again from 0 rather than waiting for them to pass its old cursor.
+- **A device's site is a setting**, which the app sets when it adopts the device; its store is
+  `/sd/store/<site hex>/`, and a device given another site starts another directory, leaving the first. Until it has
+  a site and a card it keeps nothing, and its screen says its records are not stored.
+  `GET /api/store/info` gives the site, the store's ID, its format, the card's space, and each feature's status, e.g.
+  how its latest poll went, which the features' record pages gave before.
+- **Nothing is put before SNTP has set the clock**, as versions and the journal's days come from it.
+- **Logging is with the `log` macros**, never `eprintln!`, which on a device with no computer reading its USB port
+  panics.
+- **Paths fit FAT's long names**: a hash key's parts, 64 hex characters for an ID, under `/sd/store/<64 hex>/`, are
+  within ESP-IDF's `CONFIG_FATFS_MAX_LFN` of 255, which the firmware sets already.
+
+### What the crate needs first
+
+The journal is kept in memory with its records' attributes, see file.rs, which suits the app but not a device: a day
+of 10 second Tesla records is about 8,640 lines of about 1.2 KB, some 10 MB, more than a device's 8 MB of PSRAM.
+
+- **A lean journal index**: for each record in the journal, only its sort key, version, sequence number and where its
+  line is, a day and an offset, under its hash key, with origins interned, about 100 bytes a record, so a day of Tesla
+  is about 1 MB, and the two or three days not yet compacted fit. A put's check of the stored version, a get and a
+  query read the line from the file when they need its attributes. The app uses the same index, which takes its memory
+  down as well, so there is one way, not two.
+- **Streaming compaction**: from the index, each DataSet's day file is merged with the journal's lines for it in sort
+  key order, a line at a time, read by offset, so that compaction holds only the index, not a day's lines.
+- **A streaming change feed**: the journal's days are already in sequence order, so the feed finds where `since` is by
+  halving a day file, as the capture devices' `day_files.rs` does now, and gives the lines from there, rather than
+  collecting every change into memory. A cursor older than what has been compacted is rare, e.g. a new peer, and reads
+  the compacted files as now.
+- **PSRAM for the index**: ESP-IDF gives an allocation below `CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL`, 16 KB by default,
+  from internal RAM first, so the index's many small allocations would use the internal RAM that TLS and DMA need.
+  Lower the threshold, keep `CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL` for DMA, and measure with `/api/memory`. The
+  threshold is 0 since 6 November, on the Guitron: with the default, the store filled the internal RAM, so that a
+  thread for the change feed could not be started.
+
+So a capture device runs the whole store, and only a board with PSRAM can be one: the Guitron and the RLCD, both
+ESP32-S3 N16R8. A board without PSRAM, such as the CYD or the Waveshare ESP32-C6, is not a capture device but, later,
+one of two smaller things:
+
+- **A display device**, which shows what a capture device has, fed by its change feed or its pages, keeping no store.
+- **A simple logger**, of its own sensors, e.g. temperature, which appends its records to a journal in the store's
+  format and gives them as a change feed, a line of RAM at a time, with none of the index, compaction, queries or
+  taking in other nodes' records, for a capture device or the app to pull.
+
+Until then they keep their old firmware, which the app no longer reads.
+
+### The records a device kept before
+
+- **Converted on the device**, at its first start with the store, each feature's `/sd/capture/<feature>/<date>.jsonl`
+  put into the store as the items it would have written, with the progress on its screen, in a thread of its own
+  while the features poll, as a converted record and a new one never share a key. Octopus's are converted after its
+  first poll, which finds the account their hash key is made from, as the old records do not say it.
+- **Done again if cut short**: what was put is put again, which changes nothing, and a record in the store,
+  `device.converted`, says when it is complete, so a restart part way through starts again. `/sd/capture` is left as it
+  was, see [Versions of formats](#versions-of-formats).
+
+### Order of work
+
+1. The crate: the lean index, streaming compaction and feed, the store's ID, `log`, with tests on the Mac, and the app
+   checked on its real store afterwards.
+2. The crate built for `xtensa-esp32s3-espidf`, and its dependencies checked to build there.
+3. The shared kinds file, and the Guitron's firmware writing to the store, with `/api/store/changes` and
+   `/api/store/info`, and converting its old records.
+4. The app's replicator, in place of each module's reading of devices, tried with a scratch profile, `--home`, which
+   adopts only the Guitron, with its Tesla and climate features only, so that no account is asked anything.
+5. The RLCD, when Bruce is there.
+6. Then [Replication](#replication) between devices and owners of the internet sources.
+
 ## Versions of formats
 
 What a store keeps changes over time in two ways, versioned separately, so that neither needs the whole of a store

@@ -9,6 +9,8 @@ the design changes, as it is the master copy.
 - Std only, no async runtime: it must build for ESP-IDF targets as well as macOS, Linux and Windows, so no
   dependency may need an OS feature ESP-IDF lacks.
 - `cargo build` and `cargo test`. Format with `cargo fmt`, see `rustfmt.toml`; `cargo fmt --check` should pass.
+- `cargo deny check` should pass: a new dependency outside the licences rule, see the README and `deny.toml`, fails
+  until it is approved and listed there by crate.
 - It is published to crates.io, so a published version can never be changed or removed. Do not publish; the
   maintainer does.
 

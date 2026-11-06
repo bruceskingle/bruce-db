@@ -12,6 +12,9 @@ members = ["bruce-util-progress"]
 
 [dependencies]
 anyhow = "1"
+# Warnings, e.g. a line of the journal which cannot be read, which on a device must not be written with eprintln!, which
+# panics when no computer reads its USB port.
+log = "0.4"
 # Progress and cancellation of long work, e.g. compaction, a package of this repository for now, see its README.
 bruce-util-progress = { version = "0.1.0", path = "bruce-util-progress" }
 base64 = "0.22"
@@ -19,5 +22,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # RFC 8785 canonical JSON, for IDs, see id.rs.
 serde_jcs = "0.2"
+# NFC, for IDs, see id.rs. (MIT OR Apache-2.0) AND Unicode-3.0, for Unicode's tables, approved for every crate.
+unicode-normalization = "0.1"
 sha2 = "0.10"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }

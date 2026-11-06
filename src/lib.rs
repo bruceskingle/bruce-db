@@ -62,6 +62,11 @@ impl Store {
         &self.site
     }
 
+    /// See Backend::store_id.
+    pub fn store_id(&self) -> String {
+        self.backend.store_id()
+    }
+
     /// The hash key of a DataSet of the kind in this store's site, see key::hash_key.
     pub fn hash_key(&self, kind: &str, parts: &[Part]) -> anyhow::Result<String> {
         hash_key(&self.site, kind, parts)

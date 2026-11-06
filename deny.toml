@@ -1,0 +1,34 @@
+# cargo-deny's checks, run with `cargo deny check`: the licences of every crate in the build, see the licences rule in
+# the README, the advisories against them, and where they come from.
+
+[graph]
+all-features = true
+
+[licenses]
+# Crates which are MIT OR Apache-2.0 pass by Apache-2.0, so that one which is MIT only, or another permissive licence,
+# fails until it is listed below, by crate, with what pulls it in. Unicode-3.0, the Unicode Consortium's licence for
+# its tables, MIT-like, is approved for every crate.
+allow = ["Apache-2.0", "Unicode-3.0"]
+confidence-threshold = 0.9
+
+# Permissive crates which the dependencies pull in, which the rule allows: a direct dependency must be MIT OR
+# Apache-2.0, unless approved, and what it pulls in must be permissive.
+exceptions = [
+    # Pulled in by sha2, through digest.
+    { crate = "generic-array", allow = ["MIT"] },
+    # Pulled in by serde_json, which formats numbers with it.
+    { crate = "zmij", allow = ["MIT"] },
+    # Unlicense OR MIT, pulled in by serde_json.
+    { crate = "memchr", allow = ["MIT"] },
+]
+
+[advisories]
+# RustSec's advisories: a vulnerable crate fails, an unmaintained one is a warning, so that it is seen.
+unmaintained = "workspace"
+
+[bans]
+multiple-versions = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

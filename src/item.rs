@@ -167,6 +167,33 @@ impl Line {
     }
 }
 
+/// A line's keys, sequence number and version without its attributes, which is all an index of the lines needs, read
+/// without building the attributes' JSON, which is most of a line, e.g. a Tesla snapshot's responses.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub(crate) struct Head {
+    pub n: u64,
+    pub o: String,
+    pub hk: String,
+    pub sk: String,
+    pub v: String,
+}
+
+impl Head {
+    pub fn parse(text: &str) -> anyhow::Result<Head> {
+        serde_json::from_str(text).map_err(|error| anyhow!("A line of the store is not a record, {error}"))
+    }
+
+    pub fn of(line: &Line) -> Head {
+        Head {
+            n: line.n,
+            o: line.o.clone(),
+            hk: line.hk.clone(),
+            sk: line.sk.clone(),
+            v: line.v.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

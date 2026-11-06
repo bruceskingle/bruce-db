@@ -1,8 +1,8 @@
 # Bruce's Database: design
 
 A shared record store for Marco Sparko (the app and its capture devices), and later other applications, such as a
-family tree. This began as a design discussion in November 2026; this file is now the master copy. Nothing here is
-built yet.
+family tree. This began as a design discussion in November 2026; this file is now the master copy. The crate's first
+version, the record model, IDs, the file backend, compaction, the change feed and blobs, is built, see src/.
 
 ## Summary
 
@@ -219,15 +219,17 @@ its hash key's parts as the path, holding one file, as a DataSet is now, or, for
 
 ```
 <root>/<site>/
-  journal/2026-11-04.jsonl                        every put, in arrival order: {"t","from","o","hk","sk","v","a"}
+  journal/2026-11-04.jsonl                        every put, in arrival order: {"n","t","from","o","hk","sk","v","a"}
   climate.period/441bf6cc7fcc/temperature/
     2026/11/03.jsonl                              a series: a file a day, by sort key, newest version
   octopus.account/<64 hex characters>/records.jsonl   a single record or a list: one file
 ```
 
 - **The journal is the only file written while a day is going on**: appends and a sync, as the capture devices do
-  now, so a crash loses at most the line being written. Its `t`, when the node stored the put, is also the
-  replication cursor.
+  now, so a crash loses at most the line being written. Each line has `n`, its sequence number in the node's store,
+  one more than the last, which orders the change feed and is the replication cursor, and `t`, when it was stored,
+  for people to read. The node is the store's only writer, so the numbers are never given twice or out of order, and
+  no clock is involved; the last is kept through compaction, in `state.json`.
 - **Compaction** runs once a journal day has ended and a grace period, say a day, has passed for late arrivals: it
   reads the journal, keeps the newest version of each record, merges into the existing files, writes each to a
   temporary name and renames it over, then deletes the journal. An hour of steady temperature, about 60 journal lines
@@ -253,7 +255,9 @@ key's first part.
 | `v` | String | the time, then the origin's ID inverted |
 | `o` | String | `441bf6cc7fcc` |
 | `a` or `enc` | Map | `{value: 19.9, unit: "°C", open: true}` |
-| `t` | String | when it was stored, for the change feed |
+| `w` | String | the site and the writer, the node which put it, the change feed's partition key |
+| `n` | Number | the writer's sequence number of the put, the change feed's sort key |
+| `t` | String | when it was stored, for people to read |
 | `deleted`, `ttl` | Bool, Number | only on tombstones, so that DynamoDB's TTL clears them in time |
 
 - **The version is one string**, the time then the origin's ID with each byte inverted, so that comparing strings is
@@ -261,9 +265,20 @@ key's first part.
   refused condition is `Put::Older`. Unlike the journal, DynamoDB only ever holds the winning version.
 - **A DataSet is one partition**, and a range a `Query` with `sk BETWEEN`, which includes both ends, so the end is
   dropped by the client; `begins_with(sk, "2026-11")` gets a month.
-- **The change feed is a global secondary index** on the time stored, not DynamoDB Streams, which keep only 24 hours,
-  too short for a device away for longer. It is read from a few minutes before the cursor, as the writers' clocks
-  differ and a repeat does no harm.
+- **The change feed is a global secondary index** whose partition key is the site and the writer, `w`, the node which
+  put the item into the table, and whose sort key is that writer's sequence number, `n`, from its own store, see
+  [Layout on disk](#layout-on-disk). Many nodes write to the one table, so no one sequence orders its changes, and a
+  time would not do: clocks differ, and a write can land just after a reader has read past its time. So a reader's
+  cursor is a sequence number for each writer, `{"app-3f…": 1042, "441bf6cc7fcc": 88}`, each read from its own
+  partition, and nothing is missed or needs reading again.
+- **Not DynamoDB Streams for the feed**, as they keep only 24 hours, too short for a device away for longer, and the
+  feed must be the same pull, from a cursor, as between files, so that every peer replicates one way.
+- **Pushing changes as they happen, later**: Streams, which DynamoDB pushes on every write, can feed a Lambda which
+  publishes to SNS or SQS, or to clients subscribed over WebSockets, so that a node or a page learns of a change at
+  once rather than at its next pull. That is a notification, saying a writer of a site has put changes up to a
+  sequence number, not the data's only path: a subscriber still pulls from its cursor, so one which missed
+  notifications, or was away, catches up the same way, and the 24 hours do not matter. A capture device could tell the
+  app of its changes the same way, over its own connection.
 - **An item is at most 400 KB**, which is why each slot is a record, not a month of them.
 
 ## Operations and the backend
@@ -308,7 +323,8 @@ flowchart LR
 ```
 
 - **The feed** is `changes` over the device API, signed with the profile's key as reads are now, a page at a time:
-  `GET /api/store/changes?since=<cursor>&limit=500`.
+  `GET /api/store/changes?since=<sequence>&limit=500`. A node's store has one writer, itself, so the cursor a peer
+  keeps for it is one number, the sequence number of the last change it got.
 - **Replicated records are passed on**, as a node's own are, so that a record crosses nodes which do not pull from
   each other directly, A to B to C.
 - **They cannot loop**: a put that changes nothing, a version a node already has, is not journalled, so a record which
@@ -341,7 +357,7 @@ final.
 `bruce-embedded-std` (today's `sparko_graphql` and `sparko-embedded-std`) will be. The apps depend on the published
 versions, and a git-ignored `.cargo/config.toml` patches them to the local checkouts while both are changing.
 
-Likely dependencies: `serde_json_canonicalizer` for RFC 8785, `unicode-normalization` for NFC, `sha2`, `base64`, and
+Likely dependencies: `serde_jcs` for RFC 8785 (MIT OR Apache-2.0; `serde_json_canonicalizer` is MIT only), `unicode-normalization` for NFC, `sha2`, `base64`, and
 `uuid` with its `v1` feature, which takes the node from the caller.
 
 ### Space used
@@ -365,6 +381,61 @@ its files' sizes, by scanning or by keeping running totals:
 
 Which is enough depends on how large a store gets, which the temperature log, see [Migration](#migration-and-open-questions),
 will start to show.
+
+## Decisions of 6 November 2026
+
+Made before the crate was built, with the move of Marco Sparko's stores onto it:
+
+- **A site belongs to a profile.** Each profile names its site, and two households, e.g. Bruce's and a friend's, are
+  two sites. A redacted profile is a site of its own, made by copying with redaction.
+- **Each node keeps a file store of its own, and DynamoDB is a peer**, replicated with as a device is, rather than
+  replacing a node's store, so that every node works offline. Which backends are built is chosen by Cargo features,
+  `dynamodb` for the app only; which one a store uses is a location in its settings, e.g. `file:///…/<site>` or
+  `dynamodb://<table>?region=…`, given to `Store::open`, so no code outside the crate names a backend.
+- **An API's reply is split into records, each item's JSON as the source sent it**, with a `#fetched` record saying
+  what was asked for and when. Splitting is allowed; changing a value is not.
+- **Files, e.g. a bill's PDF, go in a blob store beside the records**, named by the SHA-256 of their contents, files on
+  disk now and an object store beside DynamoDB later, as an item is at most 400 KB; a record refers to its blob by its
+  hash.
+- **Secrets stay out of the store**: sessions, tokens and passwords stay in the profile and settings, so that they are
+  not copied to every node, until Security Contexts can carry them.
+- **IDs which are hashed**: account numbers, meter serials, MPANs, NMIs, Tesla gateway DINs and zappi serials. A
+  capture device's ID stays readable.
+- **Derived data**, see the best practice under [The record model](#the-record-model): what is cheap to work out, e.g.
+  totals and checks, is worked out by whoever reads it, which also decides how it is shown, e.g. whether a difference
+  from a bill is in the customer's favour. What is expensive, e.g. a bill's text read from its PDF, may be kept, in a
+  kind of its own, with the source record's key and version and the version of the code which made it, so that it is
+  made again when either changes.
+- **The existing profiles are converted, not fetched again**, into profiles renamed `_Old`, which only need to keep
+  working; new profiles are made which fetch fresh data a little at a time, so that no conversion of data an
+  application once changed, e.g. Octopus's meter readings, carries into them.
+- **The app reads only the store.** A build of the app before the store was kept as a snapshot, so the app does not
+  read both a device's old API and the store's feed: a device not yet moved to the store is not read until it is.
+
+## Versions of formats
+
+What a store keeps changes over time in two ways, versioned separately, so that neither needs the whole of a store
+rewritten at once, which on a shared DynamoDB table could not be done, and on a device would leave it without its data
+while it was:
+
+- **The store's own layout**, how this crate keeps records, e.g. the journal's lines and the files' names, has a
+  version in a file at the root of each site's directory, `format.json`, `{"format": 1}`. A node opening a site of an
+  older format converts it before using it, saying how far it is, see bruce-util-progress; one of a newer format is
+  refused rather than misread. On DynamoDB the format is the table's, as a node only reads and writes items through
+  this crate.
+- **A kind's records**, what an application puts in them, have a version per kind: a kind whose records change format
+  becomes a new kind, its version in its name, e.g. `octopus.reading.v2` beside `octopus.reading`, written alongside
+  the old, which is never rewritten in place. Readers move to the new kind once it is complete, by conversion, which
+  may be done lazily, as records are read, and the old kind is deleted later. A record of the old kind and one of the
+  new are never confused, as their hash keys differ, and the same works on files and on DynamoDB, where a table holds
+  both until the old is deleted.
+- **Old data is left as it was until the new is complete**, so that a conversion which is cancelled, or fails, or is
+  cut short by a crash, can be done again from the start: what it had put is put again, which changes nothing, and
+  only once it is complete is the old marked as replaced. Marco Sparko's move into the store, its profiles' version
+  0.5.0, works this way, converting the cache directory beside the store and bumping the profile's version last.
+- **On a capture device**, the store is a directory of its own, `/sd/store`, beside the records it kept before,
+  `/sd/capture`, which are left where they are, to be converted on the device or read until they age out, rather than
+  moved: renaming a directory on FAT is cheap, but there is no need to.
 
 ## Migration and open questions
 

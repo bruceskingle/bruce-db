@@ -1,0 +1,10 @@
+[package]
+name = "bruce-util-progress"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Reporting the progress of long work, and cancelling it, for libraries and the apps which call them"
+repository = "https://github.com/bruceskingle/bruce-db"
+readme = "README.md"
+
+[dependencies]

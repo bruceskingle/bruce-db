@@ -1,0 +1,23 @@
+[package]
+name = "bruce-db"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "A small record store with a hash key, a sort key and a version on every record, in files, replicated between nodes"
+repository = "https://github.com/bruceskingle/bruce-db"
+readme = "README.md"
+
+[workspace]
+members = ["bruce-util-progress"]
+
+[dependencies]
+anyhow = "1"
+# Progress and cancellation of long work, e.g. compaction, a package of this repository for now, see its README.
+bruce-util-progress = { version = "0.1.0", path = "bruce-util-progress" }
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# RFC 8785 canonical JSON, for IDs, see id.rs.
+serde_jcs = "0.2"
+sha2 = "0.10"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }

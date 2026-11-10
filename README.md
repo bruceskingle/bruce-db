@@ -7,8 +7,8 @@ Every record has a hash key, which names its DataSet, a sort key, which orders i
 the newest of which wins, so that copies of a record converge wherever they are stored. IDs are SHA-256 hashes of
 canonical JSON. Records are kept in files now, and the model maps directly onto a single DynamoDB table for later.
 
-**Status:** working, in files on a computer and on an ESP32-S3's SD card, with a change feed for replication; not yet
-published. See [docs/design.md](docs/design.md).
+**Status:** working, in files on a computer and on an ESP32-S3's SD card, with a change feed for replication; its
+format may still change before 1.0. See [docs/design.md](docs/design.md).
 
 Its first user is [Marco Sparko](https://github.com/bruceskingle/marco-sparko), a desktop app for seeing a
 household's energy, and the capture devices which poll its sources.
@@ -18,10 +18,10 @@ License
 
 Licensed under either of
 
-* Apache License, Version 2.0,
-  (./LICENSE-APACHE or http://www.apache.org/licenses/LICENSE-2.0)
-* MIT license (./LICENSE-MIT or http://opensource.org/licenses/MIT)
-  at your option.
+* Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or http://www.apache.org/licenses/LICENSE-2.0)
+* MIT license ([LICENSE-MIT](LICENSE-MIT) or http://opensource.org/licenses/MIT)
+
+at your option.
 
 Dependencies' licences
 ----------------------

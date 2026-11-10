@@ -6,5 +6,7 @@ license = "MIT OR Apache-2.0"
 description = "Reporting the progress of long work, and cancelling it, for libraries and the apps which call them"
 repository = "https://github.com/bruceskingle/bruce-db"
 readme = "README.md"
+keywords = ["progress", "cancellation", "cancel"]
+categories = ["rust-patterns"]
 
 [dependencies]

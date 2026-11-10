@@ -6,6 +6,10 @@ license = "MIT OR Apache-2.0"
 description = "A small record store with a hash key, a sort key and a version on every record, in files, replicated between nodes"
 repository = "https://github.com/bruceskingle/bruce-db"
 readme = "README.md"
+keywords = ["database", "nosql", "replication", "embedded", "esp32"]
+categories = ["database-implementations", "embedded"]
+# Only for working on the crate, not for building it.
+exclude = [".github", "AGENTS.md", "docs/Release.md"]
 
 [workspace]
 members = ["bruce-util-progress"]

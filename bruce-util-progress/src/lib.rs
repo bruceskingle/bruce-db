@@ -145,7 +145,7 @@ pub const REPORTS: usize = 50;
 /// Reports how far through total steps the step index, from 0, is, e.g. "1200 of 4839 files", at the first, the last,
 /// and about REPORTS times between, so that a few large steps say as much as thousands of small ones.
 pub fn report_count(progress: &mut dyn Progress, index: usize, total: usize, what: &str) {
-    if index % (total / REPORTS).max(1) == 0 || index + 1 == total {
+    if index.is_multiple_of((total / REPORTS).max(1)) || index + 1 == total {
         progress.report(&format!("{} of {total} {what}", index + 1));
     }
 }

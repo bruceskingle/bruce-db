@@ -749,10 +749,10 @@ impl Backend for FileBackend {
         let _lock = JournalLock::take(&self.journal_dir())?;
         let mut inner = self.inner.lock().unwrap();
         self.refresh(&mut inner)?;
-        if let Some((existing, _)) = self.newest(&inner, &item.hk, &item.sk)? {
-            if existing >= item.version {
-                return Ok(Put::Older);
-            }
+        if let Some((existing, _)) = self.newest(&inner, &item.hk, &item.sk)?
+            && existing >= item.version
+        {
+            return Ok(Put::Older);
         }
         let stored = Micros::now();
         let line = Line::new(item, Self::next_sequence(&inner), stored, from);

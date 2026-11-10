@@ -1,8 +1,8 @@
 # Releasing bruce-db
 
-How a version of bruce-db and bruce-util-progress is published to crates.io. Each version is developed on a `vX.Y.Z`
-branch, published from it, tagged, and merged to `main`. A published version can never be changed or removed, only
-yanked, which stops new projects from choosing it, so everything is checked before `cargo publish`.
+How a version of bruce-db is published to crates.io. Each version is developed on a `vX.Y.Z` branch, published from
+it, tagged, and merged to `main`. A published version can never be changed or removed, only yanked, which stops new
+projects from choosing it, so everything is checked before `cargo publish`.
 
 ## Once: a crates.io account and token
 
@@ -21,14 +21,16 @@ The checks, all of which CI runs too, see `.github/workflows/ci.yml`, except cli
 cd ~/git/bruce-db
 git switch v0.1.0
 cargo fmt --all --check
-cargo clippy --workspace --all-targets
-cargo test --workspace
+cargo clippy --all-targets
+cargo test
 cargo deny check
-cargo publish --dry-run --workspace
+cargo publish --dry-run
 ```
 
-The dry run packages both crates as crates.io would get them, builds bruce-db against the packaged
-bruce-util-progress, and stops before uploading. `cargo package --list -p bruce-db` shows what is in a package.
+bruce-util-progress, which bruce-db uses, is published first, from its own repository, see its docs/Release.md;
+until it is, the dry run fails to find it on crates.io. The dry run packages bruce-db as crates.io would get it,
+builds it against the published bruce-util-progress, not the checkout next to it, and stops before uploading.
+`cargo package --list` shows what is in the package.
 
 Then commit and push, as `cargo publish` refuses a checkout with uncommitted changes, and records the commit it
 was published from in the package:
@@ -36,18 +38,13 @@ was published from in the package:
 ```sh
 git commit -am "Release 0.1.0"
 git push
-cargo publish --workspace
+cargo publish
 ```
 
-`--workspace` publishes bruce-util-progress first, as bruce-db needs it, then bruce-db, waiting for each to be in
-crates.io's index. A crate whose version is unchanged since its last release is left out with
-`--exclude`, e.g. `cargo publish --workspace --exclude bruce-util-progress`, or published alone with `-p`.
+Check https://crates.io/crates/bruce-db, and its documentation on https://docs.rs/bruce-db, which builds within a few
+minutes.
 
-Check https://crates.io/crates/bruce-db and https://crates.io/crates/bruce-util-progress, and their documentation on
-docs.rs, https://docs.rs/bruce-db, which builds within a few minutes.
-
-Tag the release, merge it to `main`, and start the next version's branch, with the next version in both crates'
-`Cargo.toml`:
+Tag the release and merge it to `main`:
 
 ```sh
 git tag -a v0.1.0 -m "bruce-db 0.1.0"
@@ -55,7 +52,13 @@ git push origin v0.1.0
 git switch main
 git merge --squash v0.1.0 && git commit -m "Release 0.1.0"
 git push
-git switch -c v0.1.1
+```
+
+The next version's branch is made when work on it starts, as its number depends on what it is: a fix, e.g.
+`v0.1.1`, or something new, e.g. `v0.2.0`. It starts from the release's tag, with its version in `Cargo.toml`:
+
+```sh
+git switch -c v0.1.1 v0.1.0
 ```
 
 ## Apps which use it
@@ -66,5 +69,5 @@ git-ignored `.cargo/config.toml` in the app's checkout points at the checkout of
 ```toml
 [patch.crates-io]
 bruce-db = { path = "../bruce-db" }
-bruce-util-progress = { path = "../bruce-db/bruce-util-progress" }
+bruce-util-progress = { path = "../bruce-util-progress" }
 ```

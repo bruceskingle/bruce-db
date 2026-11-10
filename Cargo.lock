@@ -42,6 +42,8 @@ dependencies = [
 [[package]]
 name = "bruce-util-progress"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6881029ddf744ba996327094f2cb61740b974d424ebf887c3abec6e240aa4c19"
 
 [[package]]
 name = "cfg-if"

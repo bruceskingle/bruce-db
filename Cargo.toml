@@ -11,16 +11,13 @@ categories = ["database-implementations", "embedded"]
 # Only for working on the crate, not for building it.
 exclude = [".github", "AGENTS.md", "docs/Release.md"]
 
-[workspace]
-members = ["bruce-util-progress"]
-
 [dependencies]
 anyhow = "1"
 # Warnings, e.g. a line of the journal which cannot be read, which on a device must not be written with eprintln!, which
 # panics when no computer reads its USB port.
 log = "0.4"
-# Progress and cancellation of long work, e.g. compaction, a package of this repository for now, see its README.
-bruce-util-progress = { version = "0.1.0", path = "bruce-util-progress" }
+# Progress and cancellation of long work, e.g. compaction. To work on it alongside, see docs/Release.md's patch.
+bruce-util-progress = "0.1.0"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

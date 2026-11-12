@@ -10,7 +10,7 @@ canonical JSON. Records are kept in files now, and the model maps directly onto 
 **Status:** working, in files on a computer and on an ESP32-S3's SD card, with a change feed for replication; its
 format may still change before 1.0. See [docs/design.md](docs/design.md).
 
-Its first user is [Marco Sparko](https://github.com/bruceskingle/marco-sparko), a desktop app for seeing a
+Its first user is [Bruce's Smart Home](https://github.com/bruceskingle/bruce-smart-home), a desktop app for seeing a
 household's energy, and the capture devices which poll its sources.
 
 License

@@ -359,6 +359,55 @@ fn a_record_of_another_site_or_a_bad_hash_key_is_refused() {
     );
 }
 
+/// Compaction streams each file's records from the journal's index, a date's sort keys being a run of it, so undated
+/// sort keys which sort before and after the dated ones must still all reach the records file, and each date its own,
+/// merged with what the files already hold.
+#[test]
+fn compaction_puts_dated_and_undated_records_in_their_files_wherever_they_sort() {
+    let dir = TestDir::new("compact-runs");
+    let store = open(&dir);
+    let hk = store.hash_key("tesla.snapshot", &[Part::from("gw")]).unwrap();
+    let put = |sk: &str, seconds: i64, value: i64| {
+        store
+            .put(&Item::new(&hk, sk, version(seconds, "app"), json!({ "value": value })))
+            .unwrap();
+    };
+    let tomorrow = Micros::now().date().unwrap().next_day().unwrap();
+    // A first compaction, so that the second merges into files already there.
+    put("2026-11-01T00:00:00Z", 1, 1);
+    put("#settings", 1, 1);
+    store.compact(tomorrow).unwrap();
+    put("#settings", 2, 2);
+    put("2026-11-01T00:00:10Z", 2, 2);
+    put("2026-11-02T00:00:00Z", 2, 2);
+    put("2026-11-02T12:00:00Z", 2, 2);
+    put("2026-11-03T00:00:00Z", 2, 2);
+    put("zz-after-the-dates", 2, 2);
+    put("-", 2, 2);
+    store.compact(tomorrow).unwrap();
+
+    let reopened = open(&dir);
+    let sks: Vec<String> = reopened.all(&hk).unwrap().into_iter().map(|item| item.sk).collect();
+    assert_eq!(
+        sks,
+        [
+            "#settings",
+            "-",
+            "2026-11-01T00:00:00Z",
+            "2026-11-01T00:00:10Z",
+            "2026-11-02T00:00:00Z",
+            "2026-11-02T12:00:00Z",
+            "2026-11-03T00:00:00Z",
+            "zz-after-the-dates"
+        ]
+    );
+    assert_eq!(
+        reopened.get(&hk, "#settings").unwrap().unwrap().attributes,
+        Some(json!({ "value": 2 })),
+        "the newer version wins over the one compacted before"
+    );
+}
+
 #[test]
 fn a_cancelled_compaction_loses_nothing_and_can_be_done_again() {
     let dir = TestDir::new("cancelled");
@@ -391,7 +440,7 @@ fn a_cancelled_compaction_loses_nothing_and_can_be_done_again() {
         )
         .unwrap();
     assert_eq!(store.all(&hk).unwrap().len(), 3);
-    assert_eq!(shown.last().map(String::as_str), Some("3 of 3 files written"));
+    assert_eq!(shown.last().map(String::as_str), Some("1 of 1 DataSets compacted"));
 }
 
 #[test]

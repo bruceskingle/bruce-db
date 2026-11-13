@@ -497,8 +497,8 @@ feature later, for computers only.
    a run of it, rather than listing them all first, which ran a device out of memory; files on FAT are replaced by
    moving the old aside; and reading lines keeps its buffer.
 3. Timings of opening, refreshing and compacting, in the log, built 13 November 2026. A Mac opened a journal of two
-   days, 86 MB of 108,315 lines, in 0.42 s, so parsing is not what makes a large journal slow to open there; a
-   device's figures and compaction's are still to be read.
+   days, 86 MB of 108,315 lines, in 0.42 s, but an ESP32-S3 opened two days, 15 MB of 12,734 lines from its SD card,
+   in 47 s, about 3.7 ms a line, which is most of its start. Compaction's figures are still to be read.
 4. Parsing only the head of each line when opening.
 5. The hourly journal, compaction a step at a time, and the crash guard, with `format.json` going to 2.
 6. Keeping compacted hours, and catching up from them, with the answer for being too far behind.

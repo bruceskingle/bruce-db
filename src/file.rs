@@ -291,9 +291,11 @@ impl FileBackend {
     }
 
     /// Indexes what has been added to the journal since it was last read, by this process or another, and reads it all
-    /// again if a day has gone, compacted by another process, saying what it read. One which is slow is logged.
+    /// again if a day has gone, compacted by another process, saying what it read. One which is slow is logged, unless
+    /// it is the first reading of the journal, by opening or after this process compacted, which log their own times.
     fn refresh(&self, inner: &mut Inner) -> anyhow::Result<Indexed> {
         let started = Instant::now();
+        let first = inner.journal.days.is_empty();
         let mut indexed = Indexed::default();
         let days = journal_days(&self.journal_dir())?;
         if inner.journal.days.iter().any(|(day, _)| !days.contains(day)) {
@@ -333,7 +335,7 @@ impl FileBackend {
             indexed.bytes += position - from;
             inner.journal.days[day as usize].1 = position;
         }
-        if started.elapsed() >= SLOW_REFRESH {
+        if (!first || indexed.again) && started.elapsed() >= SLOW_REFRESH {
             info!(
                 "Read the journal of {}{} in {:.2?}: {} lines, {} kB",
                 self.dir.display(),

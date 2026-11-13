@@ -233,10 +233,16 @@ its hash key's parts as the path, holding one file, as a DataSet is now, or, for
 - **Compaction** runs once a journal day has ended and a grace period, say a day, has passed for late arrivals: it
   reads the journal, keeps the newest version of each record, merges into the existing files, writes each to a
   temporary name and renames it over, then deletes the journal. An hour of steady temperature, about 60 journal lines
-  today, becomes one.
+  today, becomes one. This is to change to an hour's journal at a time, kept for a while after, see
+  [The journal by the hour](#the-journal-by-the-hour).
 - **A query** for a range reads the compacted files for it, then the journal days not yet compacted, newest version
   winning.
 - **Each part of a hash key is a directory**: a readable part as it is, an ID in hex, see [IDs](#ids).
+- **Replacing a file on FAT**: a rename onto an existing file replaces it on macOS and Linux, but fails under ESP-IDF
+  with "File exists", which the devices' first compaction to get that far found on 13 November 2026. So the old file
+  is moved aside, to `.old`, the new one renamed into place, and the old deleted; a crash between leaves only the
+  `.old`, which is put back when the file is next read, and the journal, only deleted once compaction has finished,
+  gives the same file again.
 - **FAT32 or exFAT stays**, so a card can still be read in a Mac or PC; the SD card's own controller does the wear
   levelling, and these writes are sequential appends it handles well. ESP-IDF needs long file names on, as now, and
   exFAT on for cards formatted that way.
@@ -280,6 +286,96 @@ key's first part.
   notifications, or was away, catches up the same way, and the 24 hours do not matter. A capture device could tell the
   app of its changes the same way, over its own connection.
 - **An item is at most 400 KB**, which is why each slot is a record, not a month of them.
+
+## The journal by the hour
+
+Agreed with Bruce on 13 November 2026, after both S3 capture devices ran out of memory compacting, at 03:07 on the 12th
+and again on the 13th, the same time on both, as both had the same schedule, so that each lost the three minutes it
+took to open its store again, and the journal, never compacted, kept growing. The size of the journal was behind every
+symptom: opening a store reads and parses all of it, which made the app slow to start and a device three minutes;
+compaction listed every record of the days it folded on top of the index; and the change feed walks the whole index
+for each page, about 9 seconds a page of 500 on the RLCD. So the journal is to be kept small, and nothing is to be done
+in one big piece.
+
+Two principles, for this and what follows:
+
+- **A node serving changes keeps no state about its clients.** Each request carries all that is needed, its cursor; a
+  node never remembers its peers' cursors, nor waits for them, e.g. to compact only what every peer has read, which
+  would work for a handful of devices but ties nodes together.
+- **Nothing reads in proportion to the size of the store**, except a full copy, which reads it once, a page at a time.
+  A query reads its DataSet's files for its range, opening reads the journal not yet compacted, and catching up reads
+  what is new.
+
+The design:
+
+- **A journal file an hour**, e.g. `journal/2026-11-13T06.jsonl`, rather than a day, as a journal file can only be
+  deleted whole, so its length sets how small a step compaction can take. The daily files of stores made before are
+  read as long segments until they are compacted, within a day or two.
+- **Compaction a little and often**: an hour is compacted soon after it ends, a DataSet's file at a time, each a short
+  step, so that puts wait for at most one, and a crash loses at most one. No grace period is needed for correctness, as
+  merging is newest version wins: a late record lands in a later hour and is merged into its file when that hour is.
+  There is no special time of night, and no two nodes need to avoid each other's.
+- **Appending, not rewriting**: a time series' records nearly always sort after everything already in its file, so a
+  step mostly appends to the end of the day's file, and rewrites it, merged, only when a record falls inside it, which
+  keeps the writes to an SD card down.
+- **A crash guard**: a node notes the step it is taking, and one which starts to find a step unfinished skips that
+  file and reports it, rather than crash on it again. The capture firmware has a coarser guard since 13 November, a
+  build which crashed compacting not compacting again.
+- **Only the hours not yet compacted are in the index**, so opening reads an hour or two, parsing only each line's
+  head, `n`, `o`, `hk`, `sk` and `v`, not its attributes, which on the Mac takes a third of the time of parsing the
+  whole line.
+- **Compacted hours are kept**, read only and out of the index, for a retention period, a few days by default, then
+  deleted, so that a peer catching up reads them, in sequence order, rather than the compacted files, which are in
+  sort key order and can only be searched for a sequence number by reading all of them. The retention must
+  comfortably outlast a full copy by the slowest peer expected; days against minutes is the margin now.
+
+The change feed then has two paths, and an answer for the gap between them, never a scan of the whole store:
+
+- **Catching up**, a `since` within the journal kept: the node finds the hour file holding `since`, by its first line,
+  and reads forward. It may give a version since superseded, which is harmless, as the newest version wins.
+- **Too far behind**, a `since` older than the oldest hour kept: the answer says so, and the peer makes a full copy.
+- **A full copy** walks the compacted files in their own order, DataSet by DataSet, file by file, in sort key order,
+  having first taken the node's latest sequence number as its watermark. Its cursor carries the watermark and where it
+  has got to, a DataSet, a file and the last sort key given, so each page reads only that page, and a file rewritten
+  under it is picked up at the right place. When it is done, the peer catches up from the watermark, which brings
+  anything changed meanwhile, including a record moved into a file the walk had passed. Each page first checks that
+  the watermark is still within the journal kept, and if it is not, answers that the copy has expired and must start
+  again: the peer keeps what it has, as putting it again changes nothing, but a change to a file already passed could
+  otherwise be lost. The cursor becomes a token the peer passes back unread, rather than a number.
+
+### Volumes
+
+Later, building on the above: **a store is a set of volumes**, by default a year each, by the date its records' sort
+keys start with, and records whose sort keys have no date, e.g. accounts and settings, are a volume of their own.
+
+- **Past volumes rarely change**, but do: Octopus re-rates final half hours weeks later, a December bill comes in
+  January, and an offline device brings old readings. Every change still goes through the journal, so catching up sees
+  it.
+- **Each volume keeps its highest sequence number**, updated by compaction, which is cheap to keep from the start.
+- **A full copy goes a volume at a time**, the undated first, then the current, then back in time, and copies again
+  any volume whose highest sequence number moved while it was copied, only that one, so that a copy outlasting the
+  retention starts again only for a volume, nearly always the current one.
+- **Two stores can be compared** a volume at a time, by those numbers or a digest, without reading them.
+- **A device can drop old volumes** once the app holds them, keeping, say, the current and the one before, which
+  bounds its card and its store.
+
+### Order of work
+
+1. Done, 13 November 2026: compaction streams each file's records from the index, a date's sort keys being a run of
+   it, rather than listing them all first, and the capture firmware compacts at a time from the device's ID, between
+   01:01 and 04:58 avoiding Octopus's poll minutes, and once 10 to 20 minutes after starting, with its per-build guard.
+   The schedule is a stopgap until devices agree among themselves who does what when.
+2. Timings of opening, refreshing and compacting, in the log, to see where the app's start goes, and the app's
+   compaction moved off the path to its first page.
+3. Parsing only the head of each line when opening.
+4. The hourly journal, compaction a step at a time, and the crash guard.
+5. Keeping compacted hours, and catching up from them, with the answer for being too far behind.
+6. The full copy, with its watermark.
+7. Volumes.
+
+The hourly journal's names are a change of the store's layout, so `format.json` goes to 2, see
+[Versions of formats](#versions-of-formats), and the app's profile version with it: a store of format 1 is read as it
+is, its daily files compacted away, and a node of format 1 refuses a store of 2 rather than misread it.
 
 ## Operations and the backend
 
@@ -539,7 +635,9 @@ Open questions:
 
 - [x] Two devices' Tesla snapshots of one slot: one record, the lowest device ID winning (settled, see
   [Keys](#keys-for-each-kind)). Later, a priority set in the app instead of the ID?
-- [ ] Compaction's grace period for late records: a day?
+- [x] Compaction's grace period for late records: none, as merging is newest version wins, and an hour's journal is
+  kept after it is compacted, see [The journal by the hour](#the-journal-by-the-hour) (13 November 2026).
+- [ ] How long compacted journal hours are kept: a few days? On the app, longer?
 - [ ] The start log: stay in NVS, or into the store, so it replicates?
 - [ ] How devices trust each other: the app gives each the others' certificate fingerprints and a key when it adopts
   them?

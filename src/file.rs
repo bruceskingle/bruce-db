@@ -304,8 +304,10 @@ impl FileBackend {
     /// day's records after another.
     fn compacted(&self, hk: &str, sk: &str) -> anyhow::Result<Option<(Version, PathBuf, u64)>> {
         let path = key::data_set_dir(&self.dir, hk)?.join(key::file_of(sk));
-        let Ok(metadata) = fs::metadata(&path) else {
-            return Ok(None);
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) if restore(&path) => fs::metadata(&path)?,
+            Err(_) => return Ok(None),
         };
         let (length, modified) = (metadata.len(), metadata.modified()?);
         let mut files = self.compacted_files.lock().unwrap();
@@ -414,10 +416,11 @@ impl FileBackend {
 
     /// Writes the DataSet's file path again with the journal's lines for it, entries, by sort key, each its day's index
     /// in days and its offset, merged with the lines it has, the newer of any two of one sort key, a line at a time.
-    fn write_merged(
+    /// The entries are taken one at a time, e.g. straight from the journal's index, so that none are listed.
+    fn write_merged<'a>(
         &self,
         path: &Path,
-        entries: Vec<(Box<str>, u32, u64)>,
+        entries: impl Iterator<Item = (&'a str, u32, u64)>,
         days: &[String],
         reader: &mut LineReader,
     ) -> anyhow::Result<()> {
@@ -427,8 +430,8 @@ impl FileBackend {
         let temporary = path.with_extension("tmp");
         let mut out = BufWriter::new(File::create(&temporary)?);
         let mut old = FileLines::new(vec![path.to_path_buf()]).peekable();
-        let mut new = entries.into_iter().peekable();
-        let mut read_new = |(sk, day, offset): (Box<str>, u32, u64)| -> anyhow::Result<Line> {
+        let mut new = entries.peekable();
+        let mut read_new = |(sk, day, offset): (&str, u32, u64)| -> anyhow::Result<Line> {
             let journal = self.journal_dir().join(&days[day as usize]);
             reader
                 .read(&journal, offset)?
@@ -443,7 +446,7 @@ impl FileBackend {
                 .peek()
                 .and_then(|line| line.as_ref().ok())
                 .map(|line| line.sk.as_str());
-            let new_sk = new.peek().map(|(sk, _, _)| &**sk);
+            let new_sk = new.peek().map(|(sk, _, _)| *sk);
             let line = match (old_sk, new_sk) {
                 (None, None) => break,
                 (Some(old_sk), Some(new_sk)) if old_sk == new_sk => {
@@ -466,8 +469,7 @@ impl FileBackend {
         out.flush()?;
         out.get_ref().sync_all()?;
         drop(out);
-        fs::rename(&temporary, path).with_context(|| format!("Unable to write {}", path.display()))?;
-        Ok(())
+        replace(&temporary, path)
     }
 }
 
@@ -483,6 +485,7 @@ fn new_store_id(dir: &Path) -> anyhow::Result<String> {
 
 /// The state of the site in dir, the default if it has none yet.
 fn load_state(dir: &Path) -> anyhow::Result<State> {
+    restore(&dir.join(STATE));
     match fs::read_to_string(dir.join(STATE)) {
         Ok(text) => serde_json::from_str(&text).with_context(|| format!("The store's {STATE} can not be read")),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(State::default()),
@@ -503,7 +506,7 @@ fn journal_days(journal_dir: &Path) -> anyhow::Result<Vec<String>> {
 
 /// Reads each line of a file, if it is there, with its offset, until visit says Stop.
 fn read_texts(path: &Path, visit: &mut dyn FnMut(&str, u64) -> anyhow::Result<Flow>) -> anyhow::Result<()> {
-    let file = match File::open(path) {
+    let file = match open_replaced(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error).with_context(|| format!("Unable to read {}", path.display())),
@@ -538,8 +541,13 @@ fn read_heads(path: &Path, visit: &mut dyn FnMut(Head, u64) -> anyhow::Result<Fl
     read_texts(path, &mut |text, offset| visit(Head::parse(text)?, offset))
 }
 
-/// Reads lines where they are, keeping the files it has opened, as a query or the change feed reads many lines from a
-/// few files.
+/// How many files a LineReader keeps open, one, as a device's SD card allows only a few open at once, 4 on the capture
+/// devices, and compaction also has the file it merges and the one it writes open: with a file kept open for each
+/// journal day, compaction of four days failed with "Too many open files in system" on 13 November 2026.
+const MAX_READERS: usize = 1;
+
+/// Reads lines where they are, keeping the file it last opened, see MAX_READERS, as a query or the change feed reads
+/// many lines from one file after another.
 #[derive(Default)]
 struct LineReader {
     files: HashMap<PathBuf, BufReader<File>>,
@@ -549,7 +557,10 @@ impl LineReader {
     /// The line at offset in the file, None if the file is not there or the offset is at its end.
     fn read(&mut self, path: &Path, offset: u64) -> anyhow::Result<Option<Line>> {
         if !self.files.contains_key(path) {
-            match File::open(path) {
+            if self.files.len() >= MAX_READERS {
+                self.files.clear();
+            }
+            match open_replaced(path) {
                 Ok(file) => self
                     .files
                     .insert(path.to_path_buf(), BufReader::with_capacity(READ_BUFFER, file)),
@@ -560,7 +571,12 @@ impl LineReader {
         let Some(reader) = self.files.get_mut(path) else {
             return Ok(None);
         };
-        reader.seek(SeekFrom::Start(offset))?;
+        // Relative to where the reader is, so that a line already in its buffer, as the next one asked for usually
+        // is, is read from it, rather than the buffer being thrown away and refilled from the file for each line,
+        // which made compacting days of 10 second Tesla records take over 20 minutes on a capture device; and a seek
+        // forward on FAT goes on from where the file is, rather than from its start.
+        let here = reader.stream_position()?;
+        reader.seek_relative(offset as i64 - here as i64)?;
         let mut text = String::new();
         reader.read_line(&mut text)?;
         if text.trim().is_empty() {
@@ -596,7 +612,7 @@ impl Iterator for FileLines {
         loop {
             let Some((path, reader)) = &mut self.current else {
                 let path = self.paths.pop_front()?;
-                match File::open(&path) {
+                match open_replaced(&path) {
                     Ok(file) => self.current = Some((path, BufReader::with_capacity(READ_BUFFER, file))),
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => {
@@ -699,8 +715,68 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
     }
-    fs::rename(&temporary, path).with_context(|| format!("Unable to write {}", path.display()))?;
+    replace(&temporary, path)
+}
+
+/// Puts the file temporary in place of path. A rename replaces a file on macOS and Linux, but not on FAT under
+/// ESP-IDF, where it fails with "File exists", so there the old file is first moved aside, see aside, and deleted
+/// once the new one is in place. A crash between the two renames leaves only the old file, aside, which restore puts
+/// back, so that the file is never lost; the work being done, e.g. compaction, is then done again, as its journal is
+/// only deleted once it has finished.
+fn replace(temporary: &Path, path: &Path) -> anyhow::Result<()> {
+    let context = || format!("Unable to write {}", path.display());
+    match fs::rename(temporary, path) {
+        Ok(()) => Ok(()),
+        Err(_) if path.exists() => replace_by_moving_aside(temporary, path).with_context(context),
+        Err(error) => Err(error).with_context(context),
+    }
+}
+
+/// Puts temporary in place of path where a rename does not replace a file, see replace.
+fn replace_by_moving_aside(temporary: &Path, path: &Path) -> std::io::Result<()> {
+    let old = aside(path);
+    if old.exists() {
+        fs::remove_file(&old)?;
+    }
+    fs::rename(path, &old)?;
+    fs::rename(temporary, path)?;
+    if let Err(error) = fs::remove_file(&old) {
+        warn!("Unable to delete {}, {error:#}", old.display());
+    }
     Ok(())
+}
+
+/// Where replace moves a file aside while it puts another in its place, e.g. records.old for records.jsonl, which is
+/// not read as a DataSet's file, as only .jsonl files are.
+fn aside(path: &Path) -> PathBuf {
+    path.with_extension("old")
+}
+
+/// Puts back a file which a crash in replace left aside, if path is not there, saying whether it did, for each place a
+/// file which may have been replaced is read and found missing.
+fn restore(path: &Path) -> bool {
+    let old = aside(path);
+    if path.exists() || !old.exists() {
+        return false;
+    }
+    match fs::rename(&old, path) {
+        Ok(()) => {
+            warn!("Put back {}, which was left aside as it was replaced", path.display());
+            true
+        }
+        Err(error) => {
+            warn!("Unable to put back {}, {error:#}", path.display());
+            false
+        }
+    }
+}
+
+/// Opens a file which may have been replaced, see restore.
+fn open_replaced(path: &Path) -> std::io::Result<File> {
+    match File::open(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && restore(path) => File::open(path),
+        result => result,
+    }
 }
 
 /// Whether a day's file, whose records' sort keys all start with day, e.g. 2026-11-04, may hold any in range.
@@ -1016,31 +1092,50 @@ impl Backend for FileBackend {
         // Another process may have compacted since this one opened the store.
         let mut state = load_state(&self.dir)?;
         let compacting: Vec<u32> = days.iter().map(|day| inner.journal.day(day)).collect();
-        // The journal's newest line of each record in those days, by the file it goes in, in sort key order, as each
-        // DataSet's records are. A record whose newest line is in a later day is left to that day's compaction.
-        let mut files: BTreeMap<PathBuf, Vec<(Box<str>, u32, u64)>> = BTreeMap::new();
+        let day_names: Vec<String> = inner.journal.days.iter().map(|(day, _)| day.clone()).collect();
+        let in_days = |entry: &Entry| compacting.contains(&entry.day);
         let mut latest = state.compacted_through;
-        for (hk, records) in &inner.journal.records {
+        let mut reader = LineReader::default();
+        let count = inner.journal.records.len();
+        // The journal's newest line of each record in those days is merged into the file it goes in, a DataSet at a
+        // time and a file at a time, streamed from the journal's index in sort key order, as the files' lines are, so
+        // that compaction needs little memory beyond the index, however many records it folds: listing them all first
+        // ran a capture device out of memory. A record whose newest line is in a later day is left to that day's
+        // compaction.
+        for (index, (hk, records)) in inner.journal.records.iter().enumerate() {
+            bruce_util_progress::report_count(progress, index, count, "DataSets compacted");
             let dir = key::data_set_dir(&self.dir, hk)?;
-            for (sk, entry) in records {
-                if compacting.contains(&entry.day) {
-                    latest = latest.max(Some(entry.n));
-                    files
-                        .entry(dir.join(key::file_of(sk)))
-                        .or_default()
-                        .push((sk.clone(), entry.day, entry.offset));
+            // The dates of the records being compacted, each a run in sort key order, as the sort keys of a date all
+            // start with it, and whether any have no date, which go in the DataSet's records file, wherever they sort.
+            let mut dates: Vec<&str> = Vec::new();
+            let mut undated = false;
+            for (sk, entry) in records.iter().filter(|(_, entry)| in_days(entry)) {
+                latest = latest.max(Some(entry.n));
+                match key::sort_key_date(sk) {
+                    Some(_) if dates.last() == Some(&&sk[..10]) => {}
+                    Some(_) => dates.push(&sk[..10]),
+                    None => undated = true,
                 }
             }
-        }
-        let day_names: Vec<String> = inner.journal.days.iter().map(|(day, _)| day.clone()).collect();
-        let mut reader = LineReader::default();
-        let count = files.len();
-        for (index, (path, entries)) in files.into_iter().enumerate() {
-            // Stopping between files leaves each file whole, and the journal, which is only deleted at the end, to be
-            // compacted again, which gives the same files.
-            progress.check()?;
-            bruce_util_progress::report_count(progress, index, count, "files written");
-            self.write_merged(&path, entries, &day_names, &mut reader)?;
+            for date in dates {
+                // Stopping between files leaves each file whole, and the journal, which is only deleted at the end, to
+                // be compacted again, which gives the same files.
+                progress.check()?;
+                let entries = records
+                    .range::<str, _>((Bound::Included(date), Bound::Unbounded))
+                    .take_while(|(sk, _)| sk.starts_with(date))
+                    .filter(|(_, entry)| in_days(entry))
+                    .map(|(sk, entry)| (&**sk, entry.day, entry.offset));
+                self.write_merged(&dir.join(key::file_of(date)), entries, &day_names, &mut reader)?;
+            }
+            if undated {
+                progress.check()?;
+                let entries = records
+                    .iter()
+                    .filter(|(sk, entry)| in_days(entry) && key::sort_key_date(sk).is_none())
+                    .map(|(sk, entry)| (&**sk, entry.day, entry.offset));
+                self.write_merged(&dir.join(RECORDS), entries, &day_names, &mut reader)?;
+            }
         }
         drop(reader);
         state = State {
@@ -1089,4 +1184,50 @@ fn sorted_entries(dir: &Path) -> anyhow::Result<Vec<String>> {
     };
     names.sort();
     Ok(names)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A directory of its own for a test, deleted first in case an earlier run left it.
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bruce-db-file-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// FAT under ESP-IDF does not rename over a file, so replace moves the old one aside, which this does as it would
+    /// there, as a rename on the Mac always replaces.
+    #[test]
+    fn a_file_is_replaced_by_moving_the_old_one_aside() {
+        let dir = test_dir("replace");
+        let (path, temporary) = (dir.join("records.jsonl"), dir.join("records.tmp"));
+        fs::write(&path, "old\n").unwrap();
+        fs::write(&temporary, "new\n").unwrap();
+        replace_by_moving_aside(&temporary, &path).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
+        assert!(!temporary.exists());
+        assert!(
+            !aside(&path).exists(),
+            "the old file is deleted once the new one is in place"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A crash between replace's two renames leaves only the old file, aside, which is put back when the file is next
+    /// read, so that nothing is lost.
+    #[test]
+    fn a_file_left_aside_by_a_crash_is_put_back_when_read() {
+        let dir = test_dir("restore");
+        let path = dir.join("records.jsonl");
+        fs::write(aside(&path), "old\n").unwrap();
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut open_replaced(&path).unwrap(), &mut text).unwrap();
+        assert_eq!(text, "old\n");
+        assert!(!aside(&path).exists());
+        assert!(!restore(&path), "nothing more to put back");
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

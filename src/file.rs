@@ -920,7 +920,8 @@ impl Backend for FileBackend {
     fn sync(&self) -> anyhow::Result<()> {
         for entry in fs::read_dir(self.journal_dir())?.flatten() {
             if entry.file_name().to_string_lossy().ends_with(".jsonl") {
-                File::open(entry.path())?.sync_all()?;
+                // Windows flushes a file only through a handle which may write to it, and refuses a read-only one.
+                OpenOptions::new().append(true).open(entry.path())?.sync_all()?;
             }
         }
         Ok(())

@@ -95,6 +95,25 @@ fn the_newest_version_wins_and_of_equal_times_the_lowest_origin() {
     );
 }
 
+/// Puts which are not synced one by one, as in a bulk load, are synced together afterwards, which on Windows needs each
+/// journal file opened for writing.
+#[test]
+fn unsynced_puts_are_synced_afterwards() {
+    let dir = TestDir::new("sync");
+    let store = open(&dir);
+    store.set_sync(false);
+    let hk = store.hash_key("octopus.bill", &[]).unwrap();
+    store
+        .put(&Item::new(&hk, "2026-10-01#1", version(1, "app"), json!({"total": 1})))
+        .unwrap();
+    store.sync().unwrap();
+    store.set_sync(true);
+    assert_eq!(
+        store.get(&hk, "2026-10-01#1").unwrap().unwrap().attributes,
+        Some(json!({"total": 1}))
+    );
+}
+
 #[test]
 fn a_tombstone_deletes_a_record() {
     let dir = TestDir::new("tombstone");

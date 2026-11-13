@@ -1,5 +1,12 @@
 # ChangeLog
 
+# Release 0.2.1
+
+## Fixed
+
+- Syncing the store, after puts which were not synced one by one, failed on Windows with "Access is denied", as each
+  journal file was opened read-only to be synced.
+
 # Release 0.2.0
 
 ## New

@@ -24,9 +24,10 @@ use std::io::{BufRead, BufReader, BufWriter, Seek, SeekFrom, Write};
 use std::ops::{Bound, Range};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, bail};
-use log::warn;
+use log::{info, warn};
 
 use crate::backend::{Backend, Change, Cursor, Flow, Put};
 use crate::id::Id;
@@ -39,6 +40,21 @@ const STATE: &str = "state.json";
 
 /// How much of a file is read at a time, small enough for a device, as lines are read from many files at once.
 const READ_BUFFER: usize = 4096;
+
+/// How long a refresh may take before it is logged, as one that reads only the lines put since the last is quick, but
+/// one that reads the whole journal again, after another process compacted it, is what a page waits for.
+const SLOW_REFRESH: Duration = Duration::from_secs(1);
+
+/// What a refresh of the journal's index read, for the log, see FileBackend::refresh.
+#[derive(Debug, Default, Clone, Copy)]
+struct Indexed {
+    /// The lines indexed.
+    lines: u64,
+    /// The bytes of them.
+    bytes: u64,
+    /// Whether the index was made again from the start, as a day had been compacted by another process.
+    again: bool,
+}
 
 /// What the site's directory keeps of its own.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
@@ -247,7 +263,21 @@ impl FileBackend {
             sync_each_put: std::sync::atomic::AtomicBool::new(true),
             compacted_files: Mutex::new(std::collections::VecDeque::new()),
         };
-        backend.refresh(&mut backend.inner.lock().unwrap())?;
+        // How long opening takes, as the whole journal is read, is logged, being what an application's start waits for,
+        // see the design's order of work.
+        let started = Instant::now();
+        let mut inner = backend.inner.lock().unwrap();
+        let indexed = backend.refresh(&mut inner)?;
+        info!(
+            "Opened the store {} in {:.2?}: {} lines, {} kB, of {} journal days, {} records",
+            backend.dir.display(),
+            started.elapsed(),
+            indexed.lines,
+            indexed.bytes / 1024,
+            inner.journal.days.len(),
+            inner.journal.records.values().map(BTreeMap::len).sum::<usize>(),
+        );
+        drop(inner);
         Ok(backend)
     }
 
@@ -261,11 +291,14 @@ impl FileBackend {
     }
 
     /// Indexes what has been added to the journal since it was last read, by this process or another, and reads it all
-    /// again if a day has gone, compacted by another process.
-    fn refresh(&self, inner: &mut Inner) -> anyhow::Result<()> {
+    /// again if a day has gone, compacted by another process, saying what it read. One which is slow is logged.
+    fn refresh(&self, inner: &mut Inner) -> anyhow::Result<Indexed> {
+        let started = Instant::now();
+        let mut indexed = Indexed::default();
         let days = journal_days(&self.journal_dir())?;
         if inner.journal.days.iter().any(|(day, _)| !days.contains(day)) {
             inner.journal = Journal::default();
+            indexed.again = true;
         }
         for name in days {
             let path = self.journal_dir().join(&name);
@@ -290,13 +323,31 @@ impl FileBackend {
                 let start = position;
                 position += read as u64;
                 match Head::parse(text.trim_end()) {
-                    Ok(head) => inner.journal.add(&head, day, start)?,
+                    Ok(head) => {
+                        inner.journal.add(&head, day, start)?;
+                        indexed.lines += 1;
+                    }
                     Err(error) => warn!("Skipping a line of {}: {error:#}", path.display()),
                 }
             }
+            indexed.bytes += position - from;
             inner.journal.days[day as usize].1 = position;
         }
-        Ok(())
+        if started.elapsed() >= SLOW_REFRESH {
+            info!(
+                "Read the journal of {}{} in {:.2?}: {} lines, {} kB",
+                self.dir.display(),
+                if indexed.again {
+                    " again, compacted by another process,"
+                } else {
+                    ""
+                },
+                started.elapsed(),
+                indexed.lines,
+                indexed.bytes / 1024,
+            );
+        }
+        Ok(indexed)
     }
 
     /// The version and offset of the record's compacted line, if there is one, and the file it is in, from the file's
@@ -416,14 +467,16 @@ impl FileBackend {
 
     /// Writes the DataSet's file path again with the journal's lines for it, entries, by sort key, each its day's index
     /// in days and its offset, merged with the lines it has, the newer of any two of one sort key, a line at a time.
-    /// The entries are taken one at a time, e.g. straight from the journal's index, so that none are listed.
+    /// The entries are taken one at a time, e.g. straight from the journal's index, so that none are listed. Says how
+    /// many lines the file has, and how many of them were the journal's, for the log.
     fn write_merged<'a>(
         &self,
         path: &Path,
         entries: impl Iterator<Item = (&'a str, u32, u64)>,
         days: &[String],
         reader: &mut LineReader,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<(u64, u64)> {
+        let (mut written, mut from_journal) = (0, 0);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -432,6 +485,7 @@ impl FileBackend {
         let mut old = FileLines::new(vec![path.to_path_buf()]).peekable();
         let mut new = entries.peekable();
         let mut read_new = |(sk, day, offset): (&str, u32, u64)| -> anyhow::Result<Line> {
+            from_journal += 1;
             let journal = self.journal_dir().join(&days[day as usize]);
             reader
                 .read(&journal, offset)?
@@ -464,12 +518,14 @@ impl FileBackend {
             };
             serde_json::to_writer(&mut out, &line)?;
             out.write_all(b"\n")?;
+            written += 1;
         }
         drop(old);
         out.flush()?;
         out.get_ref().sync_all()?;
         drop(out);
-        replace(&temporary, path)
+        replace(&temporary, path)?;
+        Ok((written, from_journal))
     }
 }
 
@@ -1089,6 +1145,10 @@ impl Backend for FileBackend {
         if days.is_empty() {
             return Ok(());
         }
+        // How long compaction takes is logged, as puts, gets and queries wait while it runs, see the design's order of
+        // work.
+        let started = Instant::now();
+        let (mut files, mut written, mut from_journal) = (0u64, 0u64, 0u64);
         // Another process may have compacted since this one opened the store.
         let mut state = load_state(&self.dir)?;
         let compacting: Vec<u32> = days.iter().map(|day| inner.journal.day(day)).collect();
@@ -1126,7 +1186,9 @@ impl Backend for FileBackend {
                     .take_while(|(sk, _)| sk.starts_with(date))
                     .filter(|(_, entry)| in_days(entry))
                     .map(|(sk, entry)| (&**sk, entry.day, entry.offset));
-                self.write_merged(&dir.join(key::file_of(date)), entries, &day_names, &mut reader)?;
+                let (lines, new) =
+                    self.write_merged(&dir.join(key::file_of(date)), entries, &day_names, &mut reader)?;
+                (files, written, from_journal) = (files + 1, written + lines, from_journal + new);
             }
             if undated {
                 progress.check()?;
@@ -1134,10 +1196,12 @@ impl Backend for FileBackend {
                     .iter()
                     .filter(|(sk, entry)| in_days(entry) && key::sort_key_date(sk).is_none())
                     .map(|(sk, entry)| (&**sk, entry.day, entry.offset));
-                self.write_merged(&dir.join(RECORDS), entries, &day_names, &mut reader)?;
+                let (lines, new) = self.write_merged(&dir.join(RECORDS), entries, &day_names, &mut reader)?;
+                (files, written, from_journal) = (files + 1, written + lines, from_journal + new);
             }
         }
         drop(reader);
+        let merged = started.elapsed();
         state = State {
             id: state.id.or(inner.state.id.clone()),
             last_sequence: inner.journal.last_sequence.max(state.last_sequence),
@@ -1151,7 +1215,15 @@ impl Backend for FileBackend {
         inner.journal = Journal::default();
         // The files written may not look changed, as FAT keeps their times to 2 seconds.
         self.compacted_files.lock().unwrap().clear();
-        self.refresh(&mut inner)?;
+        let indexed = self.refresh(&mut inner)?;
+        info!(
+            "Compacted {} journal days of {} in {:.2?}: {from_journal} records merged into {files} files, {written} \
+             lines, in {merged:.2?}, and {} journal lines indexed again",
+            days.len(),
+            self.dir.display(),
+            started.elapsed(),
+            indexed.lines,
+        );
         Ok(())
     }
 

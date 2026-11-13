@@ -1,8 +1,12 @@
 # Releasing bruce-db
 
 How a version of bruce-db is published to crates.io. A published version can never be changed or removed, only yanked,
-which stops new projects from choosing it, so everything is checked before `cargo publish`. These are the steps by
-hand, until bruce-method-release does them.
+which stops new projects from choosing it, so everything is checked before `cargo publish`.
+
+Releases are made with [bruce-method-release](https://github.com/bruceskingle/bruce-method-release), run in this
+checkout: `bruce-method-release check` runs every check, changing nothing, and `bruce-method-release release` does
+the steps below, in order, after listing them and asking. The release's notes go in `docs/ChangeLog.md` first, under
+`# Release X.Y.Z`, which the check requires. The steps by hand, which the tool follows, are kept here for reference.
 
 ## Names
 

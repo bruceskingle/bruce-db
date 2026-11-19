@@ -1,1 +1,4 @@
+# Made by bruce-method-release's setup from its rustfmt.toml template. Change the template, or this repository's hooks,
+# not this file: setup replaces it, and the release checks fail while it differs.
+
 max_width = 120

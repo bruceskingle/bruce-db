@@ -113,6 +113,19 @@ pub trait Backend: Send + Sync {
     /// and stops if progress is cancelled, between files, returning Cancelled, leaving the journal to compact again.
     fn compact(&self, before: time::Date, progress: &mut dyn bruce_util_progress::Progress) -> anyhow::Result<()>;
 
+    /// Folds the journal's files of the hours which ended by before, e.g. now, into the DataSets' files, as compact does
+    /// the days, so that the journal stays an hour or two, which is what opening the store reads, see the design's
+    /// journal by the hour. The hours folded are kept, see set_retention, for peers catching up.
+    fn compact_through(
+        &self,
+        before: crate::item::Micros,
+        progress: &mut dyn bruce_util_progress::Progress,
+    ) -> anyhow::Result<()>;
+
+    /// How long the journal's files are kept once they are compacted, three days unless this says otherwise, so that a
+    /// peer which is behind catches up from them, in the order they were stored, rather than from the DataSets' files.
+    fn set_retention(&self, retention: std::time::Duration);
+
     /// Stores bytes, e.g. a bill's PDF, by their ID, the SHA-256 of them, returning it.
     fn put_blob(&self, bytes: &[u8]) -> anyhow::Result<Id>;
 

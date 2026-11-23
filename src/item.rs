@@ -2,7 +2,7 @@
 
 use std::cmp::Ordering;
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use serde_json::Value;
 use time::OffsetDateTime;
 
@@ -165,7 +165,86 @@ impl Line {
     pub fn parse(text: &str) -> anyhow::Result<Line> {
         serde_json::from_str(text).map_err(|error| anyhow!("A line of the store is not a record, {error}"))
     }
+
+    /// The line as it is written, without its newline: its JSON, sealed with its checksum, see seal.
+    pub fn to_text(&self) -> anyhow::Result<String> {
+        let mut text = serde_json::to_string(self)?;
+        seal(&mut text);
+        Ok(text)
+    }
 }
+
+/// How a line's checksum starts, after the rest of its JSON, see seal: `,"c":"`, then 8 hex digits and `"}`.
+const CHECKSUM_START: &str = ",\"c\":\"";
+/// The length of a line's checksum field and the brace closing the line, `,"c":"0123abcd"}`.
+const CHECKSUM_LENGTH: usize = CHECKSUM_START.len() + 8 + 2;
+
+/// Adds a CRC32 of the line's JSON, text, as its last field, "c", in hex, so that a line damaged on the disk, e.g. with
+/// a bit flipped by a failing SD card, which may still be JSON, e.g. with a digit changed, is found when it is read,
+/// see check. The checksum is of the JSON as it was before it was added, so that checking it needs no serialising
+/// again, only the text without it.
+pub(crate) fn seal(text: &mut String) {
+    let checksum = crc32(&[text.as_bytes()]);
+    text.pop();
+    text.push_str(&format!("{CHECKSUM_START}{checksum:08x}\"}}"));
+}
+
+/// Whether a line's text, without its newline, is as it was written, by its checksum, see seal. A line without one,
+/// written before lines had them, is taken as it is; one whose checksum is itself damaged is not.
+pub(crate) fn check(text: &str) -> anyhow::Result<()> {
+    let length = text.len();
+    let sealed = length > CHECKSUM_LENGTH
+        && text.is_char_boundary(length - CHECKSUM_LENGTH)
+        && text[length - CHECKSUM_LENGTH..].starts_with(CHECKSUM_START)
+        && text.ends_with("\"}");
+    if !sealed {
+        // A checksum field near the end, but not as one is written, is a damaged one.
+        let tail = &text.as_bytes()[length.saturating_sub(CHECKSUM_LENGTH + 4)..];
+        if tail.windows(4).any(|window| window == b"\"c\":") {
+            bail!("The line's checksum is damaged");
+        }
+        return Ok(());
+    }
+    let hex = &text[length - 10..length - 2];
+    let written = u32::from_str_radix(hex, 16).map_err(|_| anyhow!("The line's checksum, {hex}, is damaged"))?;
+    let json = &text[..length - CHECKSUM_LENGTH];
+    let actual = crc32(&[json.as_bytes(), b"}"]);
+    if actual != written {
+        bail!("The line is damaged: its checksum is {written:08x}, but its text's is {actual:08x}");
+    }
+    Ok(())
+}
+
+/// The CRC32 (IEEE, as zip's and Ethernet's) of parts, one after another, a byte at a time with CRC_TABLE, as every line
+/// read is checked, which a bit at a time made a noticeable part of reading a day of the Home Mini's readings.
+fn crc32(parts: &[&[u8]]) -> u32 {
+    let mut crc = !0u32;
+    for byte in parts.iter().flat_map(|part| part.iter()) {
+        crc = (crc >> 8) ^ CRC_TABLE[((crc ^ u32::from(*byte)) & 0xff) as usize];
+    }
+    !crc
+}
+
+/// The CRC32 of each byte, for crc32, worked out when compiled.
+const CRC_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut index = 0;
+    while index < 256 {
+        let mut crc = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        table[index] = crc;
+        index += 1;
+    }
+    table
+};
 
 /// A line's keys, sequence number and version without its attributes, which is all an index of the lines needs, read
 /// without building the attributes' JSON, which is most of a line, e.g. a Tesla snapshot's responses.
@@ -213,5 +292,36 @@ mod tests {
         assert_eq!(Micros::parse(&time.to_text()).unwrap(), time);
         assert!(Micros(time.0 + 1).to_text() > time.to_text());
         assert_eq!(Micros::parse("2026-11-04T17:20:30+10:00").unwrap(), time);
+    }
+
+    #[test]
+    fn the_checksum_is_the_standard_crc32() {
+        assert_eq!(crc32(&[b"123456789"]), 0xcbf4_3926);
+        assert_eq!(crc32(&[b"1234", b"56789"]), 0xcbf4_3926);
+    }
+
+    #[test]
+    fn a_sealed_line_is_checked_and_one_changed_is_refused() {
+        let item = Item {
+            hk: "site/tesla.snapshot/gw".to_string(),
+            sk: "2026-11-23T04:42:10Z".to_string(),
+            version: Version::new(Micros(1), "dev"),
+            attributes: Some(serde_json::json!({"power": 1234})),
+        };
+        let text = Line::new(&item, 7, Micros(2), None).to_text().unwrap();
+        assert!(text.ends_with("\"}"));
+        check(&text).unwrap();
+        assert_eq!(
+            Line::parse(&text).unwrap().a,
+            item.attributes,
+            "the checksum field is ignored when parsed"
+        );
+        let changed = text.replace("1234", "1236");
+        assert!(Line::parse(&changed).is_ok(), "still JSON");
+        assert!(check(&changed).is_err(), "but refused");
+        let unsealed = serde_json::to_string(&Line::new(&item, 7, Micros(2), None)).unwrap();
+        check(&unsealed).expect("a line from before checksums is taken as it is");
+        let damaged = text.replacen("\"c\":\"", "\"c\":\"x", 1);
+        assert!(check(&damaged).is_err(), "a damaged checksum is not taken for none");
     }
 }

@@ -147,6 +147,25 @@ impl Store {
         self.backend.compact(before, progress)
     }
 
+    /// Compacts the hours of the journal which ended by before, e.g. now, see Backend::compact_through.
+    pub fn compact_through(&self, before: Micros) -> anyhow::Result<()> {
+        self.backend.compact_through(before, &mut progress::Silent)
+    }
+
+    /// Compacts the hours which ended by before, saying how far it is with progress, and stopping if it is cancelled.
+    pub fn compact_through_with_progress(
+        &self,
+        before: Micros,
+        progress: &mut dyn progress::Progress,
+    ) -> anyhow::Result<()> {
+        self.backend.compact_through(before, progress)
+    }
+
+    /// How long compacted journal files are kept, see Backend::set_retention.
+    pub fn set_retention(&self, retention: std::time::Duration) {
+        self.backend.set_retention(retention)
+    }
+
     pub fn put_blob(&self, bytes: &[u8]) -> anyhow::Result<Id> {
         self.backend.put_blob(bytes)
     }

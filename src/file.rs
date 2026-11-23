@@ -1,10 +1,13 @@
-//! The file backend, see the design's layout on disk: a site's directory holds a journal, a file a day of every put
-//! in the order it arrived, the DataSets' files, into which compaction folds the finished journal days, one line for
-//! each record, ordered by sort key, and the blobs.
+//! The file backend, see the design's layout on disk: a site's directory holds a journal, a file an hour of every put
+//! in the order it arrived, the DataSets' files, into which compaction folds the finished journal hours, one line for
+//! each record, ordered by sort key, and the blobs. Stores made before kept the journal a file a day, which are read
+//! and compacted as they are, as a day's file sorts before its hours'.
 //!
 //! ```text
 //! <site hex>/
-//!   journal/2026-11-04.jsonl     every put, as it arrived
+//!   journal/2026-11-04T07.jsonl  every put of an hour, as it arrived
+//!   journal/kept/                the journal's hours once compacted, kept a while for peers catching up, see Retention
+//!   format.json                  the layout's version, see FORMAT
 //!   state.json                   the store's ID, the last sequence number given, and the newest compacted, see State
 //!   blobs/ab/<hex>               a blob, by the hex of its ID
 //!   <kind>/<parts>/records.jsonl a DataSet's records whose sort keys are not dates
@@ -35,8 +38,18 @@ use crate::item::{Head, Item, Line, Micros, Version};
 use crate::key::{self, RECORDS};
 
 const JOURNAL: &str = "journal";
+/// Where the journal's files go once compacted, in the journal's directory, see Retention.
+const KEPT: &str = "kept";
 const BLOBS: &str = "blobs";
 const STATE: &str = "state.json";
+/// The file which says which version of this layout a site's directory is, see the design's versions of formats: 2,
+/// with the journal by the hour, its compacted files kept, and each line's checksum; a site without one is 1, which
+/// this reads as it is.
+const FORMAT_FILE: &str = "format.json";
+const FORMAT: u64 = 2;
+/// How long the journal's files are kept once compacted, unless Backend::set_retention says otherwise: long enough for
+/// a peer which was off for a weekend to catch up from them.
+const RETENTION: Duration = Duration::from_secs(3 * 24 * 60 * 60);
 
 /// How much of a file is read at a time, small enough for a device, as lines are read from many files at once.
 const READ_BUFFER: usize = 4096;
@@ -166,6 +179,8 @@ struct Inner {
 
 /// Where a record's newest line is.
 enum Location {
+    /// A line of a DataSet's file found by its offset alone, for the change feed, see FileBackend::compacted_after.
+    Line { path: PathBuf, offset: u64 },
     /// In the journal's day file of that name, e.g. 2026-11-04.jsonl.
     Journal { day: String, offset: u64 },
     /// In a DataSet's file.
@@ -180,6 +195,17 @@ pub struct FileBackend {
     sync_each_put: std::sync::atomic::AtomicBool,
     /// The compacted files read most recently, by their records' sort keys, see compacted.
     compacted_files: Mutex<std::collections::VecDeque<CompactedFile>>,
+    /// How long the journal's files are kept once compacted, see Backend::set_retention. A Mutex, as the ESP32's Xtensa
+    /// cores have no 64 bit atomics.
+    retention: Mutex<Duration>,
+    /// The first sequence number of each kept journal file, by its name, read once, see kept_from.
+    kept_firsts: Mutex<HashMap<String, Option<u64>>>,
+    /// The sequence numbers in each DataSet's file, for the change feed of a peer further behind than the kept
+    /// journal, see compacted_after, so that each file is read once, rather than for every page.
+    compacted_sequences: Mutex<HashMap<PathBuf, Sequences>>,
+    /// The sort key of the last line of each DataSet's file read, with its size and when it was modified, see
+    /// last_sort_key.
+    last_sort_keys: Mutex<HashMap<PathBuf, (u64, std::time::SystemTime, String)>>,
 }
 
 /// A compacted file's index as it was read, see FileBackend::compacted, the version and offset of each line by its
@@ -222,7 +248,7 @@ impl FileBackend {
                         if let Some(rest) = line.hk.strip_prefix(&from_prefix) {
                             line.hk = format!("{to_prefix}{rest}");
                         }
-                        text.push_str(&serde_json::to_string(&line)?);
+                        text.push_str(&line.to_text()?);
                         text.push('\n');
                         Ok(Flow::Continue)
                     })?;
@@ -244,6 +270,7 @@ impl FileBackend {
         let dir = root.join(site.hex());
         fs::create_dir_all(dir.join(JOURNAL))
             .with_context(|| format!("Unable to make the store's directory {}", dir.display()))?;
+        check_format(&dir)?;
         let mut state = load_state(&dir)?;
         if state.id.is_none() {
             // Under the lock, and read again, so that two processes opening a new store at once give it one ID.
@@ -262,6 +289,10 @@ impl FileBackend {
             }),
             sync_each_put: std::sync::atomic::AtomicBool::new(true),
             compacted_files: Mutex::new(std::collections::VecDeque::new()),
+            retention: Mutex::new(RETENTION),
+            kept_firsts: Mutex::new(HashMap::new()),
+            compacted_sequences: Mutex::new(HashMap::new()),
+            last_sort_keys: Mutex::new(HashMap::new()),
         };
         // How long opening takes, as the whole journal is read, is logged, being what an application's start waits for,
         // see the design's order of work.
@@ -269,7 +300,7 @@ impl FileBackend {
         let mut inner = backend.inner.lock().unwrap();
         let indexed = backend.refresh(&mut inner)?;
         info!(
-            "Opened the store {} in {:.2?}: {} lines, {} kB, of {} journal days, {} records",
+            "Opened the store {} in {:.2?}: {} lines, {} kB, of {} journal files, {} records",
             backend.dir.display(),
             started.elapsed(),
             indexed.lines,
@@ -288,6 +319,10 @@ impl FileBackend {
 
     fn journal_dir(&self) -> PathBuf {
         self.dir.join(JOURNAL)
+    }
+
+    fn kept_dir(&self) -> PathBuf {
+        self.dir.join(JOURNAL).join(KEPT)
     }
 
     /// Indexes what has been added to the journal since it was last read, by this process or another, and reads it all
@@ -314,22 +349,21 @@ impl FileBackend {
             file.seek(SeekFrom::Start(from))?;
             let mut reader = BufReader::with_capacity(READ_BUFFER, file);
             let mut position = from;
-            let mut text = String::new();
+            let mut bytes = Vec::new();
             loop {
-                text.clear();
-                let read = reader.read_line(&mut text)?;
+                let read = read_bytes(&mut reader, &mut bytes)?;
                 // A line without its newline is still being written, or was cut short by a crash, so it is left.
-                if read == 0 || !text.ends_with('\n') {
+                if read == 0 || !bytes.ends_with(b"\n") {
                     break;
                 }
                 let start = position;
                 position += read as u64;
-                match Head::parse(text.trim_end()) {
+                match line_text(&bytes).and_then(Head::parse) {
                     Ok(head) => {
                         inner.journal.add(&head, day, start)?;
                         indexed.lines += 1;
                     }
-                    Err(error) => warn!("Skipping a line of {}: {error:#}", path.display()),
+                    Err(error) => warn!("Skipping the line at {start} of {}: {error:#}", path.display()),
                 }
             }
             indexed.bytes += position - from;
@@ -363,6 +397,22 @@ impl FileBackend {
             Err(_) => return Ok(None),
         };
         let (length, modified) = (metadata.len(), metadata.modified()?);
+        // A record of a series is nearly always newer than any in its day's file, so after its last line, which says
+        // it is not there without the file's index, which takes seconds to read from a device's SD card for a day of
+        // 10 second samples.
+        let cached = self
+            .compacted_files
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|file| file.path == path && file.length == length && file.modified == modified);
+        if !cached
+            && self
+                .last_sort_key(&path, length, modified)?
+                .is_some_and(|last| sk > last.as_str())
+        {
+            return Ok(None);
+        }
         let mut files = self.compacted_files.lock().unwrap();
         let cached = files
             .iter()
@@ -422,7 +472,7 @@ impl FileBackend {
     fn read(&self, reader: &mut LineReader, hk: &str, sk: &str, location: &Location) -> anyhow::Result<Option<Line>> {
         let found = match location {
             Location::Journal { day, offset } => reader.read(&self.journal_dir().join(day), *offset)?,
-            Location::File { path, offset } => reader.read(path, *offset)?,
+            Location::File { path, offset } | Location::Line { path, offset } => reader.read(path, *offset)?,
         };
         if let Some(line) = found.filter(|line| line.hk == hk && line.sk == sk) {
             return Ok(Some(line));
@@ -441,9 +491,11 @@ impl FileBackend {
         inner.journal.last_sequence.max(inner.state.last_sequence).unwrap_or(0) + 1
     }
 
-    /// The head and offset of every compacted line of the site, and the file it is in, for changes from before the
-    /// journal.
-    fn all_compacted(&self, visit: &mut dyn FnMut(&Path, Head, u64) -> anyhow::Result<Flow>) -> anyhow::Result<()> {
+    /// Offers first the first limit compacted lines of the site with sequence numbers after since, for the change feed
+    /// of a peer further behind than the kept journal, see changes, as Pending lines located by their offsets alone.
+    /// Every file is read the first time, which on a device takes minutes, and its sequence numbers kept, see Sequences,
+    /// but only while it has any after since, so that the pages after the first read only their lines.
+    fn compacted_after(&self, since: u64, limit: usize, first: &mut BinaryHeap<Pending>) -> anyhow::Result<()> {
         let mut dirs = vec![self.dir.clone()];
         while let Some(dir) = dirs.pop() {
             for entry in fs::read_dir(&dir)?.flatten() {
@@ -454,8 +506,63 @@ impl FileBackend {
                         continue;
                     }
                     dirs.push(path);
-                } else if name.ends_with(".jsonl") {
-                    read_heads(&path, &mut |head, offset| visit(&path, head, offset))?;
+                    continue;
+                }
+                if !name.ends_with(".jsonl") {
+                    continue;
+                }
+                let metadata = entry.metadata()?;
+                let (length, modified) = (metadata.len(), metadata.modified()?);
+                let known = self
+                    .compacted_sequences
+                    .lock()
+                    .unwrap()
+                    .get(&path)
+                    .filter(|known| (known.length, known.modified) == (length, modified))
+                    .cloned();
+                if known.as_ref().is_some_and(|known| known.highest <= since) {
+                    continue;
+                }
+                let lines = match known.and_then(|known| known.lines) {
+                    Some(lines) => lines,
+                    None => {
+                        let mut lines = Vec::new();
+                        read_heads(&path, &mut |head, offset| {
+                            lines.push((head.n, offset));
+                            Ok(Flow::Continue)
+                        })?;
+                        lines.sort_unstable();
+                        Arc::new(lines)
+                    }
+                };
+                let highest = lines.last().map_or(0, |(n, _)| *n);
+                self.compacted_sequences.lock().unwrap().insert(
+                    path.clone(),
+                    Sequences {
+                        length,
+                        modified,
+                        highest,
+                        // Only a file with lines a peer still wants keeps them, so that the memory is the backlog's.
+                        lines: (highest > since).then(|| lines.clone()),
+                    },
+                );
+                let start = lines.partition_point(|(n, _)| *n <= since);
+                for (n, offset) in lines[start..].iter().take(limit) {
+                    if first.len() == limit && first.peek().is_some_and(|last| *n >= last.n) {
+                        break;
+                    }
+                    first.push(Pending {
+                        n: *n,
+                        hk: Arc::from(""),
+                        sk: "".into(),
+                        location: Location::Line {
+                            path: path.clone(),
+                            offset: *offset,
+                        },
+                    });
+                    if first.len() > limit {
+                        first.pop();
+                    }
                 }
             }
         }
@@ -482,10 +589,36 @@ impl FileBackend {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        let mut new = entries.peekable();
+        // A series' records nearly always all sort after the file's last line, when they are appended to it, rather
+        // than the file written again, which for a day of 10 second samples is most of a compaction's time on a
+        // device, see the design's appending, not rewriting.
+        let appending = match (fs::metadata(path), new.peek()) {
+            (Ok(metadata), Some((first, _, _))) => {
+                last_line_head(path, metadata.len())?.is_some_and(|last| *first > last.sk.as_str())
+            }
+            _ => false,
+        };
+        if appending {
+            let mut out = BufWriter::new(OpenOptions::new().append(true).open(path)?);
+            for (sk, day, offset) in new {
+                from_journal += 1;
+                let journal = self.journal_dir().join(&days[day as usize]);
+                let line = reader
+                    .read(&journal, offset)?
+                    .filter(|line| *line.sk == *sk)
+                    .with_context(|| format!("The line of {sk} is not at {offset} in {}", journal.display()))?;
+                out.write_all(line.to_text()?.as_bytes())?;
+                out.write_all(b"\n")?;
+                written += 1;
+            }
+            out.flush()?;
+            out.get_ref().sync_all()?;
+            return Ok((written, from_journal));
+        }
         let temporary = path.with_extension("tmp");
         let mut out = BufWriter::new(File::create(&temporary)?);
         let mut old = FileLines::new(vec![path.to_path_buf()]).peekable();
-        let mut new = entries.peekable();
         let mut read_new = |(sk, day, offset): (&str, u32, u64)| -> anyhow::Result<Line> {
             from_journal += 1;
             let journal = self.journal_dir().join(&days[day as usize]);
@@ -518,7 +651,7 @@ impl FileBackend {
                 (Some(_), None) => old.next().unwrap()?,
                 _ => read_new(new.next().unwrap())?,
             };
-            serde_json::to_writer(&mut out, &line)?;
+            out.write_all(line.to_text()?.as_bytes())?;
             out.write_all(b"\n")?;
             written += 1;
         }
@@ -539,6 +672,36 @@ fn new_store_id(dir: &Path) -> anyhow::Result<String> {
         "store": {"dir": dir, "created": Micros::now().to_text(), "process": std::process::id()},
     }))?
     .to_string())
+}
+
+/// The name of the journal's file for what is stored at stored, its hour's, e.g. 2026-11-04T07.jsonl, by the hour in
+/// UTC. A store made before kept a file a day, e.g. 2026-11-04.jsonl, which sorts before that day's hours.
+fn journal_file(stored: Micros) -> String {
+    format!("{}.jsonl", &stored.to_text()[..13])
+}
+
+/// Refuses a site whose layout is of a newer version than this reads, see FORMAT, and marks one made before, or new,
+/// as this version, as this writes the journal by the hour.
+fn check_format(dir: &Path) -> anyhow::Result<()> {
+    let path = dir.join(FORMAT_FILE);
+    let format = match fs::read_to_string(&path) {
+        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
+            .ok()
+            .and_then(|json| json["format"].as_u64())
+            .with_context(|| format!("The store's {FORMAT_FILE} can not be read"))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 1,
+        Err(error) => return Err(error).with_context(|| format!("Unable to read the store's {FORMAT_FILE}")),
+    };
+    if format > FORMAT {
+        bail!(
+            "The store {} is of format {format}, newer than this reads, {FORMAT}",
+            dir.display()
+        );
+    }
+    if format < FORMAT {
+        write_atomically(&path, serde_json::json!({ "format": FORMAT }).to_string().as_bytes())?;
+    }
+    Ok(())
 }
 
 /// The state of the site in dir, the default if it has none yet.
@@ -562,7 +725,25 @@ fn journal_days(journal_dir: &Path) -> anyhow::Result<Vec<String>> {
     Ok(days)
 }
 
-/// Reads each line of a file, if it is there, with its offset, until visit says Stop.
+/// Reads the next line of reader into bytes, with its newline, if it has one, returning how many bytes were read, 0 at
+/// the end. Lines are read as bytes, not text, so that one which is not UTF-8, e.g. with bits flipped by a failing SD
+/// card, as a capture device's were on 23 November 2026, is skipped, see line_text, rather than stopping the read of
+/// the whole file: the newline after it starts the next line, whatever was in it.
+fn read_bytes(reader: &mut impl BufRead, bytes: &mut Vec<u8>) -> std::io::Result<usize> {
+    bytes.clear();
+    reader.read_until(b'\n', bytes)
+}
+
+/// A line's text, without its newline, or why it can not be read: not text, see read_bytes, or not as it was written,
+/// by its checksum, see item::check.
+fn line_text(bytes: &[u8]) -> anyhow::Result<&str> {
+    let text = std::str::from_utf8(bytes).context("The line is not UTF-8")?.trim_end();
+    crate::item::check(text)?;
+    Ok(text)
+}
+
+/// Reads each line of a file, if it is there, with its offset, until visit says Stop, skipping, with a warning, one
+/// which is not text, see read_bytes.
 fn read_texts(path: &Path, visit: &mut dyn FnMut(&str, u64) -> anyhow::Result<Flow>) -> anyhow::Result<()> {
     let file = match open_replaced(path) {
         Ok(file) => file,
@@ -570,33 +751,53 @@ fn read_texts(path: &Path, visit: &mut dyn FnMut(&str, u64) -> anyhow::Result<Fl
         Err(error) => return Err(error).with_context(|| format!("Unable to read {}", path.display())),
     };
     let mut reader = BufReader::with_capacity(READ_BUFFER, file);
-    let mut text = String::new();
+    let mut bytes = Vec::new();
     let mut position = 0;
     loop {
-        text.clear();
-        let read = reader.read_line(&mut text)?;
+        let read = read_bytes(&mut reader, &mut bytes)?;
         if read == 0 {
             return Ok(());
         }
         let start = position;
         position += read as u64;
+        let text = match line_text(&bytes) {
+            Ok(text) => text,
+            Err(error) => {
+                warn!("Skipping the line at {start} of {}: {error:#}", path.display());
+                continue;
+            }
+        };
         if text.trim().is_empty() {
             continue;
         }
-        if visit(text.trim_end(), start).with_context(|| format!("In {}", path.display()))? == Flow::Stop {
+        if visit(text, start).with_context(|| format!("In {}", path.display()))? == Flow::Stop {
             return Ok(());
         }
     }
 }
 
-/// Reads each line of a file, if it is there, until visit says Stop.
+/// Reads each line of a file, if it is there, until visit says Stop, skipping, with a warning, one which can not be
+/// read, as the journal's refresh does, see read_bytes.
 fn read_lines(path: &Path, visit: &mut dyn FnMut(Line) -> anyhow::Result<Flow>) -> anyhow::Result<()> {
-    read_texts(path, &mut |text, _| visit(Line::parse(text)?))
+    read_texts(path, &mut |text, offset| match Line::parse(text) {
+        Ok(line) => visit(line),
+        Err(error) => {
+            warn!("Skipping the line at {offset} of {}: {error:#}", path.display());
+            Ok(Flow::Continue)
+        }
+    })
 }
 
-/// Reads the head of each line of a file, see Head, with its offset, if it is there, until visit says Stop.
+/// Reads the head of each line of a file, see Head, with its offset, if it is there, until visit says Stop, skipping,
+/// with a warning, one which can not be read, see read_lines.
 fn read_heads(path: &Path, visit: &mut dyn FnMut(Head, u64) -> anyhow::Result<Flow>) -> anyhow::Result<()> {
-    read_texts(path, &mut |text, offset| visit(Head::parse(text)?, offset))
+    read_texts(path, &mut |text, offset| match Head::parse(text) {
+        Ok(head) => visit(head, offset),
+        Err(error) => {
+            warn!("Skipping the line at {offset} of {}: {error:#}", path.display());
+            Ok(Flow::Continue)
+        }
+    })
 }
 
 /// How many files a LineReader keeps open, one, as a device's SD card allows only a few open at once, 4 on the capture
@@ -635,22 +836,27 @@ impl LineReader {
         // forward on FAT goes on from where the file is, rather than from its start.
         let here = reader.stream_position()?;
         reader.seek_relative(offset as i64 - here as i64)?;
-        let mut text = String::new();
-        reader.read_line(&mut text)?;
+        // A line which was indexed, so it was read before, and only one which could be is, see read_bytes.
+        let mut bytes = Vec::new();
+        read_bytes(reader, &mut bytes)?;
+        let text = line_text(&bytes).with_context(|| format!("At {offset} in {}", path.display()))?;
         if text.trim().is_empty() {
             return Ok(None);
         }
         Ok(Some(
-            Line::parse(text.trim_end()).with_context(|| format!("At {offset} in {}", path.display()))?,
+            Line::parse(text).with_context(|| format!("At {offset} in {}", path.display()))?,
         ))
     }
 }
 
-/// The lines of files, one after the other, none of a file which is not there.
+/// The lines of files, one after the other, none of a file which is not there, skipping, with a warning, one which
+/// can not be read, see read_bytes.
 struct FileLines {
     paths: std::collections::VecDeque<PathBuf>,
     current: Option<(PathBuf, BufReader<File>)>,
-    text: String,
+    bytes: Vec<u8>,
+    /// The sort key each file is read from, found by bisection, see seek_sort_key, None to read each from its start.
+    from: Option<Box<str>>,
 }
 
 impl FileLines {
@@ -658,7 +864,16 @@ impl FileLines {
         FileLines {
             paths: paths.into(),
             current: None,
-            text: String::new(),
+            bytes: Vec::new(),
+            from: None,
+        }
+    }
+
+    /// The lines of files from the first with a sort key of from or after, as a query wants.
+    fn from(paths: Vec<PathBuf>, from: &str) -> FileLines {
+        FileLines {
+            from: Some(from.into()),
+            ..FileLines::new(paths)
         }
     }
 }
@@ -671,7 +886,18 @@ impl Iterator for FileLines {
             let Some((path, reader)) = &mut self.current else {
                 let path = self.paths.pop_front()?;
                 match open_replaced(&path) {
-                    Ok(file) => self.current = Some((path, BufReader::with_capacity(READ_BUFFER, file))),
+                    Ok(mut file) => {
+                        if let Some(from) = &self.from {
+                            let start = match seek_sort_key(&mut file, from) {
+                                Ok(start) => start,
+                                Err(error) => return Some(Err(error)),
+                            };
+                            if let Err(error) = file.seek(SeekFrom::Start(start)) {
+                                return Some(Err(error.into()));
+                            }
+                        }
+                        self.current = Some((path, BufReader::with_capacity(READ_BUFFER, file)))
+                    }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                     Err(error) => {
                         return Some(Err(error).with_context(|| format!("Unable to read {}", path.display())));
@@ -679,13 +905,15 @@ impl Iterator for FileLines {
                 }
                 continue;
             };
-            self.text.clear();
-            match reader.read_line(&mut self.text) {
+            match read_bytes(reader, &mut self.bytes) {
                 Ok(0) => self.current = None,
-                Ok(_) if self.text.trim().is_empty() => {}
-                Ok(_) => {
-                    return Some(Line::parse(self.text.trim_end()).with_context(|| format!("In {}", path.display())));
-                }
+                Ok(_) => match line_text(&self.bytes)
+                    .and_then(|text| (!text.trim().is_empty()).then(|| Line::parse(text)).transpose())
+                {
+                    Ok(Some(line)) => return Some(Ok(line)),
+                    Ok(None) => {}
+                    Err(error) => warn!("Skipping a line of {}: {error:#}", path.display()),
+                },
                 Err(error) => return Some(Err(error).with_context(|| format!("Unable to read {}", path.display()))),
             }
         }
@@ -735,6 +963,17 @@ fn merge(sources: Sources, visit: &mut dyn FnMut(Line) -> anyhow::Result<Flow>) 
 }
 
 /// A change found for the feed, see changes, ordered by its sequence number alone, so that a heap keeps the first.
+/// What compacted_after keeps of a DataSet's file: its size and when it was modified, which say whether it has changed
+/// since, its highest sequence number, and, while it has any a peer still wants, the sequence number and offset of each
+/// line, in order of sequence number, 16 bytes a line.
+#[derive(Clone)]
+struct Sequences {
+    length: u64,
+    modified: std::time::SystemTime,
+    highest: u64,
+    lines: Option<Arc<Vec<(u64, u64)>>>,
+}
+
 struct Pending {
     n: u64,
     hk: Arc<str>,
@@ -837,6 +1076,63 @@ fn open_replaced(path: &Path) -> std::io::Result<File> {
     }
 }
 
+/// How much of the end of a file is read for its last line, see last_line_head: a Tesla snapshot's line is about 1.2 kB.
+const TAIL: u64 = 16 * 1024;
+
+/// The head of the last line of the file of length, None if it has none, or the last is longer than TAIL, or can not
+/// be read.
+fn last_line_head(path: &Path, length: u64) -> anyhow::Result<Option<Head>> {
+    if length == 0 {
+        return Ok(None);
+    }
+    let mut file = open_replaced(path)?;
+    let start = length.saturating_sub(TAIL);
+    file.seek(SeekFrom::Start(start))?;
+    let mut tail = Vec::new();
+    std::io::Read::read_to_end(&mut file, &mut tail)?;
+    // The last line, which ends the file with its newline; a file which does not end with one was cut short, and is
+    // read as before.
+    let Some(body) = tail.strip_suffix(b"\n") else {
+        return Ok(None);
+    };
+    let line = match body.iter().rposition(|byte| *byte == b'\n') {
+        Some(newline) => &body[newline + 1..],
+        None if start == 0 => body,
+        None => return Ok(None),
+    };
+    Ok(line_text(line).and_then(Head::parse).ok())
+}
+
+/// Where in a DataSet's file, whose lines are in sort key order, to start reading for the sort keys from from: a line's
+/// start, before which every line's sort key is before from, found by bisection, a line's head at a time, so that a
+/// query for the last hour of a day of 10 second samples reads that hour, not the day, from the start of the file.
+/// A line which can not be read is taken as after from, which only means reading more.
+fn seek_sort_key(file: &mut File, from: &str) -> anyhow::Result<u64> {
+    let length = file.metadata()?.len();
+    let (mut low, mut high) = (0u64, length);
+    let mut bytes = Vec::new();
+    // A line found to be before from may end past high, which moves low past it; the answer is then low.
+    while high.saturating_sub(low) > READ_BUFFER as u64 {
+        let middle = low + (high - low) / 2;
+        // The start of the line after middle.
+        file.seek(SeekFrom::Start(middle))?;
+        let mut reader = BufReader::with_capacity(READ_BUFFER, &mut *file);
+        let skipped = read_bytes(&mut reader, &mut bytes)? as u64;
+        let start = middle + skipped;
+        let read = read_bytes(&mut reader, &mut bytes)? as u64;
+        if start >= high || read == 0 {
+            high = middle;
+            continue;
+        }
+        match line_text(&bytes).and_then(Head::parse) {
+            Ok(head) if head.sk.as_str() < from => low = start + read,
+            _ => high = middle,
+        }
+    }
+    // low is the file's start, or just after a newline.
+    Ok(low)
+}
+
 /// Whether a day's file, whose records' sort keys all start with day, e.g. 2026-11-04, may hold any in range.
 fn day_in_range(day: &str, range: &Range<&str>) -> bool {
     // Every sort key in the file is from day up to, but not including, day followed by the highest character.
@@ -890,9 +1186,9 @@ impl Backend for FileBackend {
         }
         let stored = Micros::now();
         let line = Line::new(item, Self::next_sequence(&inner), stored, from);
-        let day = format!("{}.jsonl", stored.date()?);
+        let day = journal_file(stored);
         let path = self.journal_dir().join(&day);
-        let mut text = serde_json::to_string(&line)?;
+        let mut text = line.to_text()?;
         text.push('\n');
         let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
         let before = file.metadata()?.len();
@@ -994,8 +1290,8 @@ impl Backend for FileBackend {
         // A DataSet's records.jsonl and its day files each hold their lines in sort key order, but one's may sort
         // between the other's, e.g. 2026-11 between the last of October's days and the first of November's.
         let sources: Sources = vec![
-            Box::new(FileLines::new(vec![dir.join(RECORDS)])),
-            Box::new(FileLines::new(days)),
+            Box::new(FileLines::from(vec![dir.join(RECORDS)], range.start)),
+            Box::new(FileLines::from(days, range.start)),
             Box::new(journal),
         ];
         merge(sources, &mut |line| {
@@ -1048,25 +1344,26 @@ impl Backend for FileBackend {
             }
             inner.state.compacted_through
         };
-        if compacted_through.is_some_and(|through| through > since.0) {
-            self.all_compacted(&mut |path, head, offset| {
-                offer(&mut first, head.n, &mut || Pending {
-                    n: head.n,
-                    hk: Arc::from(head.hk.as_str()),
-                    sk: head.sk.as_str().into(),
-                    location: Location::File {
-                        path: path.to_path_buf(),
-                        offset,
-                    },
-                });
-                Ok(Flow::Continue)
-            })?;
+        if compacted_through.is_some_and(|through| through > since.0) && !self.kept_from(since.0, limit, &mut first)? {
+            self.compacted_after(since.0, limit, &mut first)?;
         }
         let mut cursor = since;
         let mut reader = LineReader::default();
         for pending in first.into_sorted_vec() {
+            let found = match &pending.location {
+                // A compacted line found by its sequence number, which is checked, as its file may have been written
+                // again since it was read, when the page ends before it, and the file is read again for the next.
+                Location::Line { path, offset } => match reader.read(path, *offset)? {
+                    Some(line) if line.n == pending.n => Some(line),
+                    _ => {
+                        self.compacted_sequences.lock().unwrap().remove(path);
+                        break;
+                    }
+                },
+                location => self.read(&mut reader, &pending.hk, &pending.sk, location)?,
+            };
             cursor = Cursor(pending.n);
-            let Some(line) = self.read(&mut reader, &pending.hk, &pending.sk, &pending.location)? else {
+            let Some(line) = found else {
                 continue;
             };
             if for_peer.is_some_and(|peer| line.from.as_deref() == Some(peer) || line.o == peer) {
@@ -1138,16 +1435,73 @@ impl Backend for FileBackend {
     }
 
     fn compact(&self, before: time::Date, progress: &mut dyn bruce_util_progress::Progress) -> anyhow::Result<()> {
+        // A day's file, and its hours', sort before the next day's, see journal_file.
+        self.compact_files(&format!("{before}.jsonl"), progress)
+    }
+
+    fn compact_through(&self, before: Micros, progress: &mut dyn bruce_util_progress::Progress) -> anyhow::Result<()> {
+        self.compact_files(&journal_file(before), progress)
+    }
+
+    fn set_retention(&self, retention: Duration) {
+        *self.retention.lock().unwrap() = retention;
+    }
+    fn put_blob(&self, bytes: &[u8]) -> anyhow::Result<Id> {
+        let id = Id::of_bytes(bytes);
+        let path = self.blob_path(&id);
+        if !path.exists() {
+            write_atomically(&path, bytes)?;
+        }
+        Ok(id)
+    }
+
+    fn get_blob(&self, id: &Id) -> anyhow::Result<Option<Vec<u8>>> {
+        match fs::read(self.blob_path(id)) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
+impl FileBackend {
+    /// The sort key of the last line of a DataSet's file, of length and modified then, read from its end, None if it
+    /// can not be read, e.g. as the line is longer than TAIL or damaged, when the caller reads the file as before.
+    fn last_sort_key(
+        &self,
+        path: &Path,
+        length: u64,
+        modified: std::time::SystemTime,
+    ) -> anyhow::Result<Option<String>> {
+        if let Some((known_length, known_modified, last)) = self.last_sort_keys.lock().unwrap().get(path)
+            && (*known_length, *known_modified) == (length, modified)
+        {
+            return Ok(Some(last.clone()));
+        }
+        let last = last_line_head(path, length)?.map(|head| head.sk);
+        if let Some(last) = &last {
+            self.last_sort_keys
+                .lock()
+                .unwrap()
+                .insert(path.to_path_buf(), (length, modified, last.clone()));
+        }
+        Ok(last)
+    }
+
+    /// Compacts the journal's files whose names sort before bound, e.g. 2026-11-04T07.jsonl, the hours before 07:00 on
+    /// 4 November, or 2026-11-04.jsonl, the days before it, see Backend::compact and compact_through.
+    fn compact_files(&self, bound: &str, progress: &mut dyn bruce_util_progress::Progress) -> anyhow::Result<()> {
         let _lock = JournalLock::take(&self.journal_dir())?;
         let mut inner = self.inner.lock().unwrap();
         self.refresh(&mut inner)?;
         let days: Vec<String> = journal_days(&self.journal_dir())?
             .into_iter()
-            .filter(|name| name.as_str() < format!("{before}.jsonl").as_str())
+            .filter(|name| name.as_str() < bound)
             .collect();
         if days.is_empty() {
             return Ok(());
         }
+
         // How long compaction takes is logged, as puts, gets and queries wait while it runs, see the design's order of
         // work.
         let started = Instant::now();
@@ -1212,15 +1566,13 @@ impl Backend for FileBackend {
         };
         write_atomically(&self.dir.join(STATE), serde_json::to_string(&state)?.as_bytes())?;
         inner.state = state;
-        for day in &days {
-            fs::remove_file(self.journal_dir().join(day))?;
-        }
+        self.keep(&days)?;
         inner.journal = Journal::default();
         // The files written may not look changed, as FAT keeps their times to 2 seconds.
         self.compacted_files.lock().unwrap().clear();
         let indexed = self.refresh(&mut inner)?;
         info!(
-            "Compacted {} journal days of {} in {:.2?}: {from_journal} records merged into {files} files, {written} \
+            "Compacted {} journal files of {} in {:.2?}: {from_journal} records merged into {files} files, {written} \
              lines, in {merged:.2?}, and {} journal lines indexed again",
             days.len(),
             self.dir.display(),
@@ -1230,21 +1582,100 @@ impl Backend for FileBackend {
         Ok(())
     }
 
-    fn put_blob(&self, bytes: &[u8]) -> anyhow::Result<Id> {
-        let id = Id::of_bytes(bytes);
-        let path = self.blob_path(&id);
-        if !path.exists() {
-            write_atomically(&path, bytes)?;
+    /// Moves the journal's files, once compacted, into the kept directory, then deletes those kept longer than the
+    /// retention, by their names' times, see Backend::set_retention. A file of an hour kept already, e.g. as the clock
+    /// was set back, so that its hour was put to again after it was compacted, is added to the end of the kept one, its
+    /// lines being after those, so that the kept hours still have every line in the order stored.
+    fn keep(&self, files: &[String]) -> anyhow::Result<()> {
+        let kept = self.kept_dir();
+        fs::create_dir_all(&kept)?;
+        for name in files {
+            let (path, target) = (self.journal_dir().join(name), kept.join(name));
+            if target.exists() {
+                let bytes = fs::read(&path)?;
+                let mut out = OpenOptions::new().append(true).open(&target)?;
+                out.write_all(&bytes)?;
+                out.sync_all()?;
+                drop(out);
+                fs::remove_file(&path)?;
+            } else {
+                fs::rename(&path, &target)?;
+            }
         }
-        Ok(id)
+        let retention = *self.retention.lock().unwrap();
+        let oldest = journal_file(Micros(Micros::now().0 - retention.as_micros() as i64));
+        let mut firsts = self.kept_firsts.lock().unwrap();
+        for name in journal_days(&kept)? {
+            if name < oldest {
+                fs::remove_file(kept.join(&name))?;
+                firsts.remove(&name);
+            }
+        }
+        Ok(())
     }
 
-    fn get_blob(&self, id: &Id) -> anyhow::Result<Option<Vec<u8>>> {
-        match fs::read(self.blob_path(id)) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.into()),
+    /// Offers first the changes after since from the kept journal files, in the order stored, see changes, if they go
+    /// back as far as since, saying whether they did. If they do not, e.g. as the peer is further behind than the
+    /// retention, or the store was compacted before files were kept, the caller reads the DataSets' files instead. A
+    /// kept line may have been superseded since, which is harmless, as the newest version wins.
+    fn kept_from(&self, since: u64, limit: usize, first: &mut BinaryHeap<Pending>) -> anyhow::Result<bool> {
+        let kept = self.kept_dir();
+        let names = match journal_days(&kept) {
+            Ok(names) => names,
+            Err(_) => return Ok(false),
+        };
+        let mut starts = Vec::new();
+        for name in &names {
+            let known = self.kept_firsts.lock().unwrap().get(name).copied();
+            let start = match known {
+                Some(start) => start,
+                None => {
+                    let mut start = None;
+                    read_heads(&kept.join(name), &mut |head, _| {
+                        start = Some(head.n);
+                        Ok(Flow::Stop)
+                    })?;
+                    self.kept_firsts.lock().unwrap().insert(name.clone(), start);
+                    start
+                }
+            };
+            if let Some(start) = start {
+                starts.push((name, start));
+            }
         }
+        // The kept files reach back to since if the oldest starts at or before the change after it.
+        if starts.first().is_none_or(|(_, start)| *start > since + 1) {
+            return Ok(false);
+        }
+        let from = starts.iter().rposition(|(_, start)| *start <= since + 1).unwrap_or(0);
+        let mut offered = 0;
+        for (name, _) in &starts[from..] {
+            let path = kept.join(name);
+            read_heads(&path, &mut |head, offset| {
+                if head.n <= since {
+                    return Ok(Flow::Continue);
+                }
+                first.push(Pending {
+                    n: head.n,
+                    hk: Arc::from(head.hk.as_str()),
+                    sk: head.sk.as_str().into(),
+                    location: Location::File {
+                        path: path.clone(),
+                        offset,
+                    },
+                });
+                if first.len() > limit {
+                    first.pop();
+                }
+                offered += 1;
+                // The lines are in the order stored, so once limit are offered, the rest come after them.
+                Ok(if offered >= limit { Flow::Stop } else { Flow::Continue })
+            })?;
+            if offered >= limit {
+                break;
+            }
+        }
+        Ok(true)
     }
 }
 

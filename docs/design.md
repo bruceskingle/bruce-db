@@ -198,7 +198,9 @@ parts as the path, holding one file, or, for a series, a file a day.
 
 ```
 <root>/<site hex>/
-  journal/2026-11-04.jsonl                      every put, in arrival order: {"n","t","from","o","hk","sk","v","a"}
+  journal/2026-11-04T07.jsonl                   every put of an hour, in arrival order: {"n","t","from","o","hk","sk","v","a","c"}
+  journal/kept/                                 the journal's hours once compacted, kept a while for peers catching up
+  format.json                                   the layout's version, 2
   state.json                                    the store's ID, the last sequence number, the latest compacted
   sensor.temperature/441bf6cc7fcc/indoor/
     2026/11/03.jsonl                            a series: a file a day, by sort key, newest version
@@ -206,6 +208,11 @@ parts as the path, holding one file, or, for a series, a file a day.
   blobs/ab/<64 hex characters>                  a blob, by its ID's hex
 ```
 
+- **Each line ends with its checksum**, `"c"`, a CRC32 of the line's JSON before it was added, so that a line damaged
+  on the disk, e.g. with a bit flipped by a failing SD card, is found when it is read, even if it is still JSON. A line
+  which can not be read, not UTF-8, not JSON or not as its checksum says, is skipped with a warning, and the rest of
+  the file read on from the next newline, so that the damage is only that line's; one without a checksum, written
+  before 0.3.0, is taken as it is.
 - **The journal is the only file written as records arrive**: appends and, unless the caller says otherwise, see
   `Store::set_sync`, a sync after each, so that a crash loses at most the line being written. Each line has `n`, its
   sequence number in the node's store, one more than the last, which orders the change feed and is the replication
@@ -500,8 +507,15 @@ feature later, for computers only.
    days, 86 MB of 108,315 lines, in 0.42 s, but an ESP32-S3 opened two days, 15 MB of 12,734 lines from its SD card,
    in 47 s, about 3.7 ms a line, which is most of its start. Compaction's figures are still to be read.
 4. Parsing only the head of each line when opening.
-5. The hourly journal, compaction a step at a time, and the crash guard, with `format.json` going to 2.
-6. Keeping compacted hours, and catching up from them, with the answer for being too far behind.
+5. Done, 23 November 2026, for 0.3.0: the hourly journal, with `format.json` going to 2, and `compact_through` folding
+   the hours which have ended, which callers run hourly; a store's daily files are read and compacted as they are.
+   Lines which can not be read are skipped, and lines have checksums. Still to do: compaction a DataSet's file at a
+   time, appending, and the crate's own crash guard, which the capture firmware has meanwhile.
+6. Done in part, 23 November 2026, for 0.3.0: compacted hours are kept, three days by default, `set_retention`, and the
+   change feed catches up from them, a page in milliseconds. A peer further behind still reads the DataSets' files, as
+   before, but only once, as the store then keeps each file's sequence numbers and offsets, 16 bytes a line, while it
+   has any the peer still wants, so that the pages after the first take milliseconds. Still to do: the answer for
+   being too far behind, for which the full copy is needed.
 7. The full copy, with its watermark.
 8. Volumes.
 9. Later: Security Contexts, DynamoDB, the space used.

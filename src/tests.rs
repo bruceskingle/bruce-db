@@ -635,3 +635,327 @@ fn a_change_goes_over_the_feed_as_a_line_and_comes_back_the_same() {
     assert_eq!(json["from"], json!("dev1"));
     assert_eq!(Change::from_json(json).unwrap(), changes[0]);
 }
+
+/// A line of the journal garbled on the card, e.g. with bits flipped, so that it is not UTF-8, or not JSON, or not as
+/// its checksum says, is skipped,
+/// with the record in it, and the rest of the store still works: reopened, queried, put to, read for changes and
+/// compacted, as a capture device's could not be on 23 November 2026, once a line was not UTF-8.
+#[test]
+fn a_garbled_line_is_skipped_and_the_rest_of_the_store_still_works() {
+    let dir = TestDir::new("garbled");
+    let hk;
+    {
+        let store = open(&dir);
+        hk = store.hash_key("tesla.snapshot", &[Part::from("gw")]).unwrap();
+        for (index, value) in [1, 2, 3, 4].into_iter().enumerate() {
+            let sk = format!("2026-11-23T04:42:{:02}Z", index * 10);
+            store
+                .put(&Item::new(
+                    &hk,
+                    &sk,
+                    version(index as i64 + 1, "dev"),
+                    json!({"value": value}),
+                ))
+                .unwrap();
+        }
+    }
+    let journal = std::fs::read_dir(dir.0.join(site().hex()).join("journal"))
+        .unwrap()
+        .flatten()
+        .find(|entry| entry.file_name().to_string_lossy().ends_with(".jsonl"))
+        .unwrap()
+        .path();
+    let text = std::fs::read(&journal).unwrap();
+    let mut lines: Vec<Vec<u8>> = text.split(|byte| *byte == b'\n').map(<[u8]>::to_vec).collect();
+    // The second record's top bits flipped in its middle, so that it is not UTF-8, and the third's quotes, so that it is
+    // not JSON.
+    for byte in &mut lines[1][20..40] {
+        *byte |= 0x80;
+    }
+    for byte in lines[2].iter_mut().filter(|byte| **byte == b'"') {
+        *byte = b'*';
+    }
+    // And the fourth's value changed, 4 to 8, a bit flipped, which is still JSON, but not its checksum's.
+    let fourth = String::from_utf8(lines[3].clone())
+        .unwrap()
+        .replace("\"value\":4", "\"value\":8");
+    lines[3] = fourth.into_bytes();
+    std::fs::write(&journal, lines.join(&b'\n')).unwrap();
+
+    let store = open(&dir);
+    let values = |store: &Store| -> Vec<i64> {
+        store
+            .all(&hk)
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.attributes.as_ref()?.get("value")?.as_i64())
+            .collect()
+    };
+    assert_eq!(values(&store), vec![1]);
+    store
+        .put(&Item::new(
+            &hk,
+            "2026-11-23T04:43:00Z",
+            version(5, "dev"),
+            json!({"value": 5}),
+        ))
+        .unwrap();
+    assert_eq!(values(&store), vec![1, 5]);
+    let mut changed = Vec::new();
+    store
+        .changes(Cursor::START, 100, None, &mut |change| {
+            changed.push(change);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(changed.len(), 2, "the garbled records are not changes");
+    let tomorrow = Micros::now().date().unwrap().next_day().unwrap();
+    store.compact(tomorrow).unwrap();
+    assert_eq!(values(&store), vec![1, 5]);
+}
+
+/// The sequence numbers of the changes after since, up to limit, and the cursor given.
+fn sequences(store: &Store, since: u64, limit: usize) -> (Vec<u64>, u64) {
+    let mut found = Vec::new();
+    let cursor = store
+        .changes(Cursor(since), limit, None, &mut |change| {
+            found.push(change.sequence);
+            Ok(())
+        })
+        .unwrap();
+    (found, cursor.0)
+}
+
+/// The journal is written an hour a file, compacted by the hour, and the hours compacted are kept, from which a peer
+/// behind catches up in the order stored; once they have gone, after the retention, the DataSets' files give the same.
+#[test]
+fn the_journal_is_kept_by_the_hour_and_a_peer_behind_catches_up_from_the_hours_kept() {
+    let dir = TestDir::new("hourly");
+    let store = open(&dir);
+    let hk = store.hash_key("tesla.snapshot", &[Part::from("gw")]).unwrap();
+    for index in 0..6 {
+        let sk = format!("2026-11-23T04:42:{:02}Z", index * 10);
+        store
+            .put(&Item::new(&hk, &sk, version(index + 1, "dev"), json!({"value": index})))
+            .unwrap();
+    }
+    let site_dir = dir.0.join(site().hex());
+    let journal: Vec<String> = std::fs::read_dir(site_dir.join("journal"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().to_string())
+        .filter(|name| name.ends_with(".jsonl"))
+        .collect();
+    assert_eq!(journal.len(), 1, "a file for the hour");
+    assert_eq!(
+        journal[0].len(),
+        "2026-11-23T04.jsonl".len(),
+        "named by the hour: {}",
+        journal[0]
+    );
+    assert_eq!(
+        std::fs::read_to_string(site_dir.join("format.json")).unwrap(),
+        r#"{"format":2}"#
+    );
+
+    // Compacting the hours which have ended, as of an hour from now, folds it, and keeps it.
+    store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
+    assert!(!site_dir.join("journal").join(&journal[0]).exists());
+    assert!(site_dir.join("journal/kept").join(&journal[0]).exists());
+    assert_eq!(store.all(&hk).unwrap().len(), 6);
+
+    // A peer behind reads the kept hour, a page at a time, in order.
+    assert_eq!(sequences(&store, 0, 4), (vec![1, 2, 3, 4], 4));
+    assert_eq!(sequences(&store, 4, 4), (vec![5, 6], 6));
+    assert_eq!(sequences(&store, 6, 4), (vec![], 6));
+
+    // Puts after it are in a new journal file, and come after the kept ones.
+    store
+        .put(&Item::new(
+            &hk,
+            "2026-11-23T05:00:00Z",
+            version(7, "dev"),
+            json!({"value": 6}),
+        ))
+        .unwrap();
+    assert_eq!(sequences(&store, 4, 4), (vec![5, 6, 7], 7));
+
+    // Reopened, the store has the same, and a new journal file is all that opening reads.
+    drop(store);
+    let store = open(&dir);
+    assert_eq!(store.all(&hk).unwrap().len(), 7);
+    assert_eq!(sequences(&store, 2, 10), (vec![3, 4, 5, 6, 7], 7));
+
+    // The hour compacted again, as if put to after the clock was set back, is added to the kept file.
+    store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
+    assert_eq!(sequences(&store, 4, 4), (vec![5, 6, 7], 7));
+
+    // Once the kept hours have gone, after the retention, the DataSets' files give the same changes.
+    std::fs::remove_dir_all(site_dir.join("journal/kept")).unwrap();
+    assert_eq!(sequences(&store, 0, 4), (vec![1, 2, 3, 4], 4));
+    assert_eq!(sequences(&store, 4, 4), (vec![5, 6, 7], 7));
+    assert_eq!(sequences(&store, 7, 4), (vec![], 7));
+}
+
+/// A store of the layout before, with a journal a file a day, is read and compacted as it is, and marked as of this
+/// layout, as what is put now goes in the hour's file.
+#[test]
+fn a_store_with_a_journal_a_day_is_read_and_compacted_as_it_is() {
+    let dir = TestDir::new("daily");
+    let hk;
+    {
+        let store = open(&dir);
+        hk = store.hash_key("tesla.snapshot", &[Part::from("gw")]).unwrap();
+        store
+            .put(&Item::new(
+                &hk,
+                "2026-11-22T10:00:00Z",
+                version(1, "dev"),
+                json!({"value": 1}),
+            ))
+            .unwrap();
+    }
+    let site_dir = dir.0.join(site().hex());
+    let journal = site_dir.join("journal");
+    let hour = std::fs::read_dir(&journal)
+        .unwrap()
+        .flatten()
+        .find(|entry| entry.file_name().to_string_lossy().ends_with(".jsonl"))
+        .unwrap()
+        .path();
+    std::fs::rename(&hour, journal.join("2026-11-22.jsonl")).unwrap();
+    std::fs::remove_file(site_dir.join("format.json")).unwrap();
+
+    let store = open(&dir);
+    assert!(site_dir.join("format.json").exists());
+    assert_eq!(store.all(&hk).unwrap().len(), 1);
+    store
+        .put(&Item::new(
+            &hk,
+            "2026-11-22T11:00:00Z",
+            version(2, "dev"),
+            json!({"value": 2}),
+        ))
+        .unwrap();
+    assert_eq!(sequences(&store, 0, 10), (vec![1, 2], 2));
+    store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
+    assert!(!journal.join("2026-11-22.jsonl").exists());
+    assert!(journal.join("kept/2026-11-22.jsonl").exists());
+    assert_eq!(store.all(&hk).unwrap().len(), 2);
+    assert_eq!(sequences(&store, 0, 10), (vec![1, 2], 2));
+}
+
+/// A day of samples compacted an hour at a time is appended to, not written again, a late record which falls inside
+/// it is merged into it, and a query for part of the day, found by bisection, gives the same as reading it all.
+#[test]
+fn a_series_is_appended_to_and_queried_from_the_middle_of_its_day() {
+    let dir = TestDir::new("append");
+    let store = open(&dir);
+    let hk = store.hash_key("tesla.snapshot", &[Part::from("gw")]).unwrap();
+    let sk = |index: i64| {
+        format!(
+            "2026-11-23T{:02}:{:02}:{:02}Z",
+            index / 360,
+            index / 6 % 60,
+            index % 6 * 10
+        )
+    };
+    let put = |index: i64, value: i64| {
+        store
+            .put(&Item::new(
+                &hk,
+                &sk(index),
+                version(index + value, "dev"),
+                json!({"value": value, "pad": "x".repeat(200)}),
+            ))
+            .unwrap();
+    };
+    let later = || Micros(Micros::now().0 + 3_600_000_000);
+    for index in 0..1000 {
+        put(index, 0);
+    }
+    store.compact_through(later()).unwrap();
+    let file = dir.0.join(site().hex()).join("tesla.snapshot/gw/2026/11/23.jsonl");
+    let first_length = std::fs::metadata(&file).unwrap().len();
+    for index in 1000..2000 {
+        put(index, 0);
+    }
+    store.compact_through(later()).unwrap();
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(text.lines().count(), 2000);
+    assert!(text.len() as u64 > first_length);
+
+    let values = |range: std::ops::Range<i64>| -> Vec<String> {
+        store
+            .query_all(&hk, sk(range.start).as_str()..sk(range.end).as_str())
+            .unwrap()
+            .into_iter()
+            .map(|item| item.sk)
+            .collect()
+    };
+    let expected = |range: std::ops::Range<i64>| -> Vec<String> { range.map(sk).collect() };
+    assert_eq!(values(1500..1520), expected(1500..1520));
+    assert_eq!(values(0..3), expected(0..3));
+    assert_eq!(values(1995..2000), expected(1995..2000));
+    assert_eq!(values(999..1001), expected(999..1001));
+
+    // A late, newer version of a record in the middle is merged into the file, not appended.
+    put(500, 1);
+    store.compact_through(later()).unwrap();
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert_eq!(text.lines().count(), 2000);
+    let item = store.get(&hk, &sk(500)).unwrap().unwrap();
+    assert_eq!(item.attributes.unwrap()["value"], 1);
+    assert_eq!(values(499..502), expected(499..502));
+    // A put after the file's last line, which needs no index of the file, is found.
+    put(2000, 0);
+    assert_eq!(values(1999..2001), expected(1999..2001));
+}
+
+/// A query's start is found by bisection in files of every size and line length, including lines longer than the
+/// bisection's step, which end past its upper bound, which once made it subtract past zero.
+#[test]
+fn a_query_finds_its_start_in_files_of_long_and_short_lines() {
+    let dir = TestDir::new("bisect");
+    let store = open(&dir);
+    let hk = store.hash_key("tesla.snapshot", &[Part::from("gw")]).unwrap();
+    let sk = |index: i64| {
+        format!(
+            "2026-11-23T{:02}:{:02}:{:02}Z",
+            index / 3600,
+            index / 60 % 60,
+            index % 60
+        )
+    };
+    for (index, pad) in [
+        (0, 10),
+        (1, 9000),
+        (2, 10),
+        (3, 6000),
+        (4, 5000),
+        (5, 10),
+        (6, 12000),
+        (7, 10),
+    ] {
+        store
+            .put(&Item::new(
+                &hk,
+                &sk(index),
+                version(index + 1, "dev"),
+                json!({"pad": "x".repeat(pad)}),
+            ))
+            .unwrap();
+    }
+    store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
+    for from in 0..8 {
+        for to in from + 1..=8 {
+            let found: Vec<String> = store
+                .query_all(&hk, sk(from).as_str()..sk(to).as_str())
+                .unwrap()
+                .into_iter()
+                .map(|item| item.sk)
+                .collect();
+            assert_eq!(found, (from..to).map(sk).collect::<Vec<_>>(), "from {from} to {to}");
+        }
+    }
+}

@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, bail};
 use log::{info, warn};
 
-use crate::backend::{Backend, Change, Cursor, Flow, Put};
+use crate::backend::{Backend, Change, CopyPage, CopyToken, Cursor, Feed, Flow, Put};
 use crate::id::Id;
 use crate::item::{Head, Item, Line, Micros, Version};
 use crate::key::{self, RECORDS};
@@ -106,6 +106,9 @@ struct Journal {
     records: HashMap<Arc<str>, BTreeMap<Box<str>, Entry>>,
     /// The latest sequence number in it.
     last_sequence: Option<u64>,
+    /// The earliest sequence number in it, which is usually one after the newest compacted, but may be before it if
+    /// the clock was set back, so that an hour compacted later holds lines put earlier, see FileBackend::reaches.
+    first_sequence: Option<u64>,
 }
 
 impl Journal {
@@ -142,13 +145,26 @@ impl Journal {
         Version::new(entry.time, &self.origins[entry.origin as usize])
     }
 
+    /// The first and last sequence numbers in it, if it has any lines, see FileBackend::reaches.
+    fn span(&self) -> Option<(u64, u64)> {
+        self.first_sequence.zip(self.last_sequence)
+    }
+
     fn get(&self, hk: &str, sk: &str) -> Option<&Entry> {
         self.records.get(hk).and_then(|records| records.get(sk))
+    }
+
+    /// Removes the record's entry, whose line is damaged, see Damaged, so that a copy of the same version replaces it.
+    fn forget(&mut self, hk: &str, sk: &str) {
+        if let Some(records) = self.records.get_mut(hk) {
+            records.remove(sk);
+        }
     }
 
     /// Indexes the line head, at offset in the day's file, if it is the newest of its record.
     fn add(&mut self, head: &Head, day: u32, offset: u64) -> anyhow::Result<()> {
         self.last_sequence = self.last_sequence.max(Some(head.n));
+        self.first_sequence = Some(self.first_sequence.map_or(head.n, |first| first.min(head.n)));
         let entry = Entry {
             n: head.n,
             time: Micros::parse(&head.v)?,
@@ -179,8 +195,6 @@ struct Inner {
 
 /// Where a record's newest line is.
 enum Location {
-    /// A line of a DataSet's file found by its offset alone, for the change feed, see FileBackend::compacted_after.
-    Line { path: PathBuf, offset: u64 },
     /// In the journal's day file of that name, e.g. 2026-11-04.jsonl.
     Journal { day: String, offset: u64 },
     /// In a DataSet's file.
@@ -198,11 +212,9 @@ pub struct FileBackend {
     /// How long the journal's files are kept once compacted, see Backend::set_retention. A Mutex, as the ESP32's Xtensa
     /// cores have no 64 bit atomics.
     retention: Mutex<Duration>,
-    /// The first sequence number of each kept journal file, by its name, read once, see kept_from.
-    kept_firsts: Mutex<HashMap<String, Option<u64>>>,
-    /// The sequence numbers in each DataSet's file, for the change feed of a peer further behind than the kept
-    /// journal, see compacted_after, so that each file is read once, rather than for every page.
-    compacted_sequences: Mutex<HashMap<PathBuf, Sequences>>,
+    /// The first and last sequence numbers of each kept journal file, by its name, with the length they were read at,
+    /// so that each is read again only when added to, see kept_spans.
+    kept_spans: Mutex<HashMap<String, (u64, Span)>>,
     /// The sort key of the last line of each DataSet's file read, with its size and when it was modified, see
     /// last_sort_key.
     last_sort_keys: Mutex<HashMap<PathBuf, (u64, std::time::SystemTime, String)>>,
@@ -290,8 +302,7 @@ impl FileBackend {
             sync_each_put: std::sync::atomic::AtomicBool::new(true),
             compacted_files: Mutex::new(std::collections::VecDeque::new()),
             retention: Mutex::new(RETENTION),
-            kept_firsts: Mutex::new(HashMap::new()),
-            compacted_sequences: Mutex::new(HashMap::new()),
+            kept_spans: Mutex::new(HashMap::new()),
             last_sort_keys: Mutex::new(HashMap::new()),
         };
         // How long opening takes, as the whole journal is read, is logged, being what an application's start waits for,
@@ -469,10 +480,24 @@ impl FileBackend {
     /// The line of the record hk and sk at location, read with reader. A journal day may have been compacted since it
     /// was indexed, by another thread or process, and a compacted file rewritten, in which case the line is found again
     /// in its DataSet's file; None if it is not there either.
+    ///
+    /// A line damaged since it was indexed, see Damaged, is taken as missing, and a compacted file's index, which held
+    /// it, read again, skipping it.
     fn read(&self, reader: &mut LineReader, hk: &str, sk: &str, location: &Location) -> anyhow::Result<Option<Line>> {
-        let found = match location {
-            Location::Journal { day, offset } => reader.read(&self.journal_dir().join(day), *offset)?,
-            Location::File { path, offset } | Location::Line { path, offset } => reader.read(path, *offset)?,
+        let read = match location {
+            Location::Journal { day, offset } => reader.read(&self.journal_dir().join(day), *offset),
+            Location::File { path, offset } => reader.read(path, *offset),
+        };
+        let found = match read {
+            Ok(found) => found,
+            Err(error) if is_damaged(&error) => {
+                warn!("Taking {hk} {sk} as missing: {error:#}");
+                if let Location::File { path, .. } = location {
+                    self.compacted_files.lock().unwrap().retain(|file| file.path != *path);
+                }
+                None
+            }
+            Err(error) => return Err(error),
         };
         if let Some(line) = found.filter(|line| line.hk == hk && line.sk == sk) {
             return Ok(Some(line));
@@ -489,84 +514,6 @@ impl FileBackend {
     /// The next sequence number to store with, one after the last given, see State.
     fn next_sequence(inner: &Inner) -> u64 {
         inner.journal.last_sequence.max(inner.state.last_sequence).unwrap_or(0) + 1
-    }
-
-    /// Offers first the first limit compacted lines of the site with sequence numbers after since, for the change feed
-    /// of a peer further behind than the kept journal, see changes, as Pending lines located by their offsets alone.
-    /// Every file is read the first time, which on a device takes minutes, and its sequence numbers kept, see Sequences,
-    /// but only while it has any after since, so that the pages after the first read only their lines.
-    fn compacted_after(&self, since: u64, limit: usize, first: &mut BinaryHeap<Pending>) -> anyhow::Result<()> {
-        let mut dirs = vec![self.dir.clone()];
-        while let Some(dir) = dirs.pop() {
-            for entry in fs::read_dir(&dir)?.flatten() {
-                let path = entry.path();
-                let name = entry.file_name().to_string_lossy().to_string();
-                if path.is_dir() {
-                    if dir == self.dir && (name == JOURNAL || name == BLOBS) {
-                        continue;
-                    }
-                    dirs.push(path);
-                    continue;
-                }
-                if !name.ends_with(".jsonl") {
-                    continue;
-                }
-                let metadata = entry.metadata()?;
-                let (length, modified) = (metadata.len(), metadata.modified()?);
-                let known = self
-                    .compacted_sequences
-                    .lock()
-                    .unwrap()
-                    .get(&path)
-                    .filter(|known| (known.length, known.modified) == (length, modified))
-                    .cloned();
-                if known.as_ref().is_some_and(|known| known.highest <= since) {
-                    continue;
-                }
-                let lines = match known.and_then(|known| known.lines) {
-                    Some(lines) => lines,
-                    None => {
-                        let mut lines = Vec::new();
-                        read_heads(&path, &mut |head, offset| {
-                            lines.push((head.n, offset));
-                            Ok(Flow::Continue)
-                        })?;
-                        lines.sort_unstable();
-                        Arc::new(lines)
-                    }
-                };
-                let highest = lines.last().map_or(0, |(n, _)| *n);
-                self.compacted_sequences.lock().unwrap().insert(
-                    path.clone(),
-                    Sequences {
-                        length,
-                        modified,
-                        highest,
-                        // Only a file with lines a peer still wants keeps them, so that the memory is the backlog's.
-                        lines: (highest > since).then(|| lines.clone()),
-                    },
-                );
-                let start = lines.partition_point(|(n, _)| *n <= since);
-                for (n, offset) in lines[start..].iter().take(limit) {
-                    if first.len() == limit && first.peek().is_some_and(|last| *n >= last.n) {
-                        break;
-                    }
-                    first.push(Pending {
-                        n: *n,
-                        hk: Arc::from(""),
-                        sk: "".into(),
-                        location: Location::Line {
-                            path: path.clone(),
-                            offset: *offset,
-                        },
-                    });
-                    if first.len() > limit {
-                        first.pop();
-                    }
-                }
-            }
-        }
-        Ok(())
     }
 
     fn blob_path(&self, id: &Id) -> PathBuf {
@@ -603,11 +550,10 @@ impl FileBackend {
             let mut out = BufWriter::new(OpenOptions::new().append(true).open(path)?);
             for (sk, day, offset) in new {
                 from_journal += 1;
-                let journal = self.journal_dir().join(&days[day as usize]);
-                let line = reader
-                    .read(&journal, offset)?
-                    .filter(|line| *line.sk == *sk)
-                    .with_context(|| format!("The line of {sk} is not at {offset} in {}", journal.display()))?;
+                let Some(line) = journal_line(reader, &self.journal_dir().join(&days[day as usize]), sk, offset)?
+                else {
+                    continue;
+                };
                 out.write_all(line.to_text()?.as_bytes())?;
                 out.write_all(b"\n")?;
                 written += 1;
@@ -619,13 +565,9 @@ impl FileBackend {
         let temporary = path.with_extension("tmp");
         let mut out = BufWriter::new(File::create(&temporary)?);
         let mut old = FileLines::new(vec![path.to_path_buf()]).peekable();
-        let mut read_new = |(sk, day, offset): (&str, u32, u64)| -> anyhow::Result<Line> {
+        let mut read_new = |(sk, day, offset): (&str, u32, u64)| -> anyhow::Result<Option<Line>> {
             from_journal += 1;
-            let journal = self.journal_dir().join(&days[day as usize]);
-            reader
-                .read(&journal, offset)?
-                .filter(|line| *line.sk == *sk)
-                .with_context(|| format!("The line of {sk} is not at {offset} in {}", journal.display()))
+            journal_line(reader, &self.journal_dir().join(&days[day as usize]), sk, offset)
         };
         loop {
             if let Some(Err(_)) = old.peek() {
@@ -640,16 +582,17 @@ impl FileBackend {
                 (None, None) => break,
                 (Some(old_sk), Some(new_sk)) if old_sk == new_sk => {
                     let old_line = old.next().unwrap()?;
-                    let new_line = read_new(new.next().unwrap())?;
-                    if new_line.version()? > old_line.version()? {
-                        new_line
-                    } else {
-                        old_line
+                    match read_new(new.next().unwrap())? {
+                        Some(new_line) if new_line.version()? > old_line.version()? => new_line,
+                        _ => old_line,
                     }
                 }
                 (Some(old_sk), Some(new_sk)) if old_sk < new_sk => old.next().unwrap()?,
                 (Some(_), None) => old.next().unwrap()?,
-                _ => read_new(new.next().unwrap())?,
+                _ => match read_new(new.next().unwrap())? {
+                    Some(line) => line,
+                    None => continue,
+                },
             };
             out.write_all(line.to_text()?.as_bytes())?;
             out.write_all(b"\n")?;
@@ -661,6 +604,23 @@ impl FileBackend {
         drop(out);
         replace(&temporary, path)?;
         Ok((written, from_journal))
+    }
+}
+
+/// The journal's line of sk at offset in the journal's file, for compaction, or None, with a warning, if it is damaged,
+/// see Damaged, so that compaction goes on without the record, which a peer may send again, rather than failing until
+/// the hour is deleted.
+fn journal_line(reader: &mut LineReader, journal: &Path, sk: &str, offset: u64) -> anyhow::Result<Option<Line>> {
+    match reader.read(journal, offset) {
+        Ok(line) => line
+            .filter(|line| *line.sk == *sk)
+            .map(Some)
+            .with_context(|| format!("The line of {sk} is not at {offset} in {}", journal.display())),
+        Err(error) if is_damaged(&error) => {
+            warn!("Compacting without {sk}: {error:#}");
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -737,9 +697,29 @@ fn read_bytes(reader: &mut impl BufRead, bytes: &mut Vec<u8>) -> std::io::Result
 /// A line's text, without its newline, or why it can not be read: not text, see read_bytes, or not as it was written,
 /// by its checksum, see item::check.
 fn line_text(bytes: &[u8]) -> anyhow::Result<&str> {
-    let text = std::str::from_utf8(bytes).context("The line is not UTF-8")?.trim_end();
-    crate::item::check(text)?;
+    let text = std::str::from_utf8(bytes)
+        .context("The line is not UTF-8")
+        .context(Damaged)?
+        .trim_end();
+    crate::item::check(text).context(Damaged)?;
     Ok(text)
+}
+
+/// Marks the error of a line which is not as it was written, see line_text, so that a reader which expected a record
+/// there, as the line was indexed before it was damaged, e.g. by bits flipped on an SD card, takes the record as
+/// missing, see FileBackend::read, and a peer's copy of it can replace it, see put.
+#[derive(Debug)]
+struct Damaged;
+
+impl std::fmt::Display for Damaged {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Unable to read the line")
+    }
+}
+
+/// Whether error is of a line which is damaged, see Damaged.
+fn is_damaged(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<Damaged>().is_some()
 }
 
 /// Reads each line of a file, if it is there, with its offset, until visit says Stop, skipping, with a warning, one
@@ -963,17 +943,6 @@ fn merge(sources: Sources, visit: &mut dyn FnMut(Line) -> anyhow::Result<Flow>) 
 }
 
 /// A change found for the feed, see changes, ordered by its sequence number alone, so that a heap keeps the first.
-/// What compacted_after keeps of a DataSet's file: its size and when it was modified, which say whether it has changed
-/// since, its highest sequence number, and, while it has any a peer still wants, the sequence number and offset of each
-/// line, in order of sequence number, 16 bytes a line.
-#[derive(Clone)]
-struct Sequences {
-    length: u64,
-    modified: std::time::SystemTime,
-    highest: u64,
-    lines: Option<Arc<Vec<(u64, u64)>>>,
-}
-
 struct Pending {
     n: u64,
     hk: Arc<str>,
@@ -1179,10 +1148,22 @@ impl Backend for FileBackend {
         let _lock = JournalLock::take(&self.journal_dir())?;
         let mut inner = self.inner.lock().unwrap();
         self.refresh(&mut inner)?;
-        if let Some((existing, _)) = self.newest(&inner, &item.hk, &item.sk)?
+        if let Some((existing, location)) = self.newest(&inner, &item.hk, &item.sk)?
             && existing >= item.version
         {
-            return Ok(Put::Older);
+            // The same version again, e.g. sent by a peer, replaces the record's line if that can not be read, see
+            // Damaged, so that a peer's copy repairs it.
+            if existing > item.version
+                || self
+                    .read(&mut LineReader::default(), &item.hk, &item.sk, &location)?
+                    .is_some_and(|line| line.v == item.version.time.to_text() && line.o == item.version.origin)
+            {
+                return Ok(Put::Older);
+            }
+            warn!("Replacing the damaged line of {} {} with a copy", item.hk, item.sk);
+            if let Location::Journal { .. } = location {
+                inner.journal.forget(&item.hk, &item.sk);
+            }
         }
         let stored = Micros::now();
         let line = Line::new(item, Self::next_sequence(&inner), stored, from);
@@ -1308,14 +1289,14 @@ impl Backend for FileBackend {
         limit: usize,
         for_peer: Option<&str>,
         visit: &mut dyn FnMut(Change) -> anyhow::Result<()>,
-    ) -> anyhow::Result<Cursor> {
+    ) -> anyhow::Result<Feed> {
         if limit == 0 {
-            return Ok(since);
+            return Ok(Feed::Next(since));
         }
         // The first limit changes after since, by sequence number, from the journal's index and, if since is before the
-        // end of what was compacted, from the DataSets' files, which keep each line's sequence number, read without
-        // their attributes. Superseded lines are not in either, so a record's newest version is given, once, unless
-        // a newer one was put after it was compacted, which is given as well, harmlessly.
+        // end of what was compacted, from the journal's kept hours, or, if they do not go back that far, none: the peer
+        // is too far behind, and makes a full copy, see copy, as finding the changes in the DataSets' files, which are
+        // in sort key order, means reading all of them, which on a device takes minutes.
         let mut first: BinaryHeap<Pending> = BinaryHeap::new();
         let offer = |first: &mut BinaryHeap<Pending>, n: u64, make: &mut dyn FnMut() -> Pending| {
             if n <= since.0 || (first.len() == limit && first.peek().is_some_and(|last| n >= last.n)) {
@@ -1326,7 +1307,7 @@ impl Backend for FileBackend {
                 first.pop();
             }
         };
-        let compacted_through = {
+        let (compacted_through, journal) = {
             let mut inner = self.inner.lock().unwrap();
             self.refresh(&mut inner)?;
             for (hk, records) in &inner.journal.records {
@@ -1342,26 +1323,17 @@ impl Backend for FileBackend {
                     });
                 }
             }
-            inner.state.compacted_through
+            (inner.state.compacted_through, inner.journal.span())
         };
-        if compacted_through.is_some_and(|through| through > since.0) && !self.kept_from(since.0, limit, &mut first)? {
-            self.compacted_after(since.0, limit, &mut first)?;
+        if let Some(through) = compacted_through.filter(|through| *through > since.0)
+            && !self.kept_from(since.0, through, journal, limit, &mut first)?
+        {
+            return Ok(Feed::TooFarBehind);
         }
         let mut cursor = since;
         let mut reader = LineReader::default();
         for pending in first.into_sorted_vec() {
-            let found = match &pending.location {
-                // A compacted line found by its sequence number, which is checked, as its file may have been written
-                // again since it was read, when the page ends before it, and the file is read again for the next.
-                Location::Line { path, offset } => match reader.read(path, *offset)? {
-                    Some(line) if line.n == pending.n => Some(line),
-                    _ => {
-                        self.compacted_sequences.lock().unwrap().remove(path);
-                        break;
-                    }
-                },
-                location => self.read(&mut reader, &pending.hk, &pending.sk, location)?,
-            };
+            let found = self.read(&mut reader, &pending.hk, &pending.sk, &pending.location)?;
             cursor = Cursor(pending.n);
             let Some(line) = found else {
                 continue;
@@ -1376,7 +1348,96 @@ impl Backend for FileBackend {
                 from: line.from.clone(),
             })?;
         }
-        Ok(cursor)
+        Ok(Feed::Next(cursor))
+    }
+
+    fn copy(
+        &self,
+        token: Option<&CopyToken>,
+        limit: usize,
+        for_peer: Option<&str>,
+        visit: &mut dyn FnMut(Change) -> anyhow::Result<()>,
+    ) -> anyhow::Result<CopyPage> {
+        // The DataSets' files are walked in the order of their paths, each in sort key order, as they are kept, from
+        // where the last page got to, so that each page reads only itself. Their records are everything compacted, by
+        // the watermark, the newest sequence number compacted when the copy started; everything after it, in the
+        // journal, kept or not, and including what compaction moves into a file the walk has passed, comes from the
+        // change feed from the watermark once the copy is done. So the journal, kept or not, must still hold every
+        // change after it, with no hour missing. The watermark is before the journal's first line, if that is earlier,
+        // as after the clock was set back, so that the catch-up also gives what is not yet compacted.
+        let (store, compacted_through, journal) = {
+            let mut inner = self.inner.lock().unwrap();
+            self.refresh(&mut inner)?;
+            (
+                inner.state.id.clone().unwrap_or_default(),
+                inner.state.compacted_through.unwrap_or(0),
+                inner.journal.span(),
+            )
+        };
+        let place = match token {
+            None => CopyPlace {
+                store: store.clone(),
+                watermark: journal.map_or(compacted_through, |(first, _)| compacted_through.min(first - 1)),
+                file: String::new(),
+                sort_key: String::new(),
+            },
+            Some(token) => match CopyPlace::of(token) {
+                Some(place) if place.store == store => place,
+                _ => return Ok(CopyPage::Expired),
+            },
+        };
+        if place.watermark < compacted_through && !self.reaches(place.watermark, compacted_through, journal)? {
+            return Ok(CopyPage::Expired);
+        }
+        if limit == 0 {
+            return Ok(CopyPage::More(place.token()?));
+        }
+        let mut file = if place.file.is_empty() {
+            next_data_file(&self.dir, None, true)?
+        } else {
+            // The file the last page ended in, from the record after its last, unless it has gone, e.g. an aside one.
+            next_data_file(&self.dir, Some(&place.file), true)?
+        };
+        let mut after =
+            (!place.file.is_empty() && file.as_deref() == Some(place.file.as_str())).then(|| place.sort_key.clone());
+        let mut given = 0;
+        while let Some(relative) = file {
+            let path = self.dir.join(&relative);
+            let lines = match &after {
+                Some(after) => FileLines::from(vec![path.clone()], after),
+                None => FileLines::new(vec![path.clone()]),
+            };
+            for line in lines {
+                let line = line?;
+                if after.as_ref().is_some_and(|after| line.sk.as_str() <= after.as_str()) {
+                    continue;
+                }
+                let sort_key = line.sk.clone();
+                if !for_peer.is_some_and(|peer| line.from.as_deref() == Some(peer) || line.o == peer) {
+                    visit(Change {
+                        item: line.item()?,
+                        sequence: line.n,
+                        stored: line.stored()?,
+                        from: line.from.clone(),
+                    })?;
+                }
+                given += 1;
+                if given >= limit {
+                    return Ok(CopyPage::More(
+                        CopyPlace {
+                            file: relative,
+                            sort_key,
+                            ..place
+                        }
+                        .token()?,
+                    ));
+                }
+                after = Some(sort_key);
+            }
+            file = next_data_file(&self.dir, Some(&relative), false)?;
+            after = None;
+        }
+        Ok(CopyPage::Done(Cursor(place.watermark)))
     }
 
     fn data_sets(&self, prefix: &str) -> anyhow::Result<Vec<String>> {
@@ -1604,56 +1665,45 @@ impl FileBackend {
         }
         let retention = *self.retention.lock().unwrap();
         let oldest = journal_file(Micros(Micros::now().0 - retention.as_micros() as i64));
-        let mut firsts = self.kept_firsts.lock().unwrap();
+        let mut spans = self.kept_spans.lock().unwrap();
         for name in journal_days(&kept)? {
             if name < oldest {
                 fs::remove_file(kept.join(&name))?;
-                firsts.remove(&name);
+                spans.remove(&name);
             }
         }
         Ok(())
     }
 
-    /// Offers first the changes after since from the kept journal files, in the order stored, see changes, if they go
-    /// back as far as since, saying whether they did. If they do not, e.g. as the peer is further behind than the
-    /// retention, or the store was compacted before files were kept, the caller reads the DataSets' files instead. A
-    /// kept line may have been superseded since, which is harmless, as the newest version wins.
-    fn kept_from(&self, since: u64, limit: usize, first: &mut BinaryHeap<Pending>) -> anyhow::Result<bool> {
-        let kept = self.kept_dir();
-        let names = match journal_days(&kept) {
-            Ok(names) => names,
-            Err(_) => return Ok(false),
-        };
-        let mut starts = Vec::new();
-        for name in &names {
-            let known = self.kept_firsts.lock().unwrap().get(name).copied();
-            let start = match known {
-                Some(start) => start,
-                None => {
-                    let mut start = None;
-                    read_heads(&kept.join(name), &mut |head, _| {
-                        start = Some(head.n);
-                        Ok(Flow::Stop)
-                    })?;
-                    self.kept_firsts.lock().unwrap().insert(name.clone(), start);
-                    start
-                }
-            };
-            if let Some(start) = start {
-                starts.push((name, start));
-            }
-        }
-        // The kept files reach back to since if the oldest starts at or before the change after it.
-        if starts.first().is_none_or(|(_, start)| *start > since + 1) {
+    /// Offers first the changes after since from the kept journal files, in the order stored, see changes, if the
+    /// journal, kept or not, holds every change from since to through, the newest compacted, saying whether it does. If
+    /// it does not, e.g. as the peer is further behind than the retention, or an hour kept has gone missing, the peer is
+    /// too far behind. A kept line may have been superseded since, which is harmless, as the newest version wins.
+    fn kept_from(
+        &self,
+        since: u64,
+        through: u64,
+        journal: Option<(u64, u64)>,
+        limit: usize,
+        first: &mut BinaryHeap<Pending>,
+    ) -> anyhow::Result<bool> {
+        if !self.reaches(since, through, journal)? {
             return Ok(false);
         }
-        let from = starts.iter().rposition(|(_, start)| *start <= since + 1).unwrap_or(0);
-        let mut offered = 0;
-        for (name, _) in &starts[from..] {
-            let path = kept.join(name);
+        let kept = self.kept_dir();
+        // In the order of their first lines, so that once limit are offered, a file which starts after the last of
+        // them has nothing to give, nor any after it; each file's lines are in the order stored.
+        for span in self.kept_spans()?.iter().filter(|span| span.last > since) {
+            if first.len() >= limit && first.peek().is_some_and(|last| span.first > last.n) {
+                break;
+            }
+            let path = kept.join(&span.name);
             read_heads(&path, &mut |head, offset| {
                 if head.n <= since {
                     return Ok(Flow::Continue);
+                }
+                if first.len() >= limit && first.peek().is_some_and(|last| head.n >= last.n) {
+                    return Ok(Flow::Stop);
                 }
                 first.push(Pending {
                     n: head.n,
@@ -1667,16 +1717,197 @@ impl FileBackend {
                 if first.len() > limit {
                     first.pop();
                 }
-                offered += 1;
-                // The lines are in the order stored, so once limit are offered, the rest come after them.
-                Ok(if offered >= limit { Flow::Stop } else { Flow::Continue })
+                Ok(Flow::Continue)
             })?;
-            if offered >= limit {
-                break;
-            }
         }
         Ok(true)
     }
+
+    /// Whether the journal holds every change after since up to through: the kept hours' spans and the journal's own,
+    /// journal, see Journal::span, together, with no gap, e.g. an hour lost from the SD card, so that a peer catching up
+    /// from since misses nothing. An hour put to again after the clock was set back is taken as holding everything
+    /// between its first and last lines, which the hours after it do.
+    fn reaches(&self, since: u64, through: u64, journal: Option<(u64, u64)>) -> anyhow::Result<bool> {
+        let spans = self.kept_spans()?;
+        Ok(covers(
+            spans.iter().map(|span| (span.first, span.last)).chain(journal),
+            since,
+            through,
+        ))
+    }
+
+    /// The kept journal files, by name, each with its first and last sequence numbers, in the order of their first, read
+    /// once, and again only when added to, see kept_spans; none if there are none, e.g. as the store was compacted
+    /// before files were kept.
+    fn kept_spans(&self) -> anyhow::Result<Vec<KeptSpan>> {
+        let kept = self.kept_dir();
+        let names = match journal_days(&kept) {
+            Ok(names) => names,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut spans = Vec::new();
+        for name in names {
+            let path = kept.join(&name);
+            let length = match fs::metadata(&path) {
+                Ok(metadata) => metadata.len(),
+                Err(_) => continue,
+            };
+            let known = self
+                .kept_spans
+                .lock()
+                .unwrap()
+                .get(&name)
+                .filter(|(known, _)| *known == length)
+                .map(|(_, span)| *span);
+            let span = match known {
+                Some(span) => span,
+                None => {
+                    let span = file_span(&path, length)?;
+                    self.kept_spans.lock().unwrap().insert(name.clone(), (length, span));
+                    span
+                }
+            };
+            if let Some((first, last)) = span {
+                spans.push(KeptSpan { name, first, last });
+            }
+        }
+        spans.sort_by_key(|span| span.first);
+        Ok(spans)
+    }
+}
+
+/// The first and last sequence numbers of part of the journal, None if it has no lines.
+type Span = Option<(u64, u64)>;
+
+/// A kept journal file, see FileBackend::kept_spans, by its name, with its first and last sequence numbers.
+struct KeptSpan {
+    name: String,
+    first: u64,
+    last: u64,
+}
+
+/// The first and last sequence numbers of a journal file of length, None if it has no lines: its first line's, and its
+/// last's, read from its end, or, if that is too long or can not be read, by reading the whole file.
+fn file_span(path: &Path, length: u64) -> anyhow::Result<Span> {
+    let mut first = None;
+    read_heads(path, &mut |head, _| {
+        first = Some(head.n);
+        Ok(Flow::Stop)
+    })?;
+    let Some(first) = first else {
+        return Ok(None);
+    };
+    let last = match last_line_head(path, length)? {
+        Some(head) => head.n,
+        None => {
+            let mut last = first;
+            read_heads(path, &mut |head, _| {
+                last = head.n;
+                Ok(Flow::Continue)
+            })?;
+            last
+        }
+    };
+    Ok(Some((first, last.max(first))))
+}
+
+/// Whether spans, each the first and last sequence numbers of part of the journal, together hold every one after
+/// since up to through, with no gap.
+fn covers(spans: impl Iterator<Item = (u64, u64)>, since: u64, through: u64) -> bool {
+    let mut spans: Vec<(u64, u64)> = spans.collect();
+    spans.sort_unstable();
+    let mut next = since + 1;
+    for (first, last) in spans {
+        if next > through {
+            break;
+        }
+        if first > next {
+            return false;
+        }
+        next = next.max(last + 1);
+    }
+    next > through
+}
+
+/// Where a full copy has got to, see FileBackend's copy, which the peer keeps as a CopyToken, this as JSON in URL safe
+/// base64, so that it is passed back unread: the store it is of, so that a token from a store since replaced, e.g. a
+/// wiped card, starts the copy again; the watermark, the newest sequence number compacted when it started, from which
+/// the peer catches up afterwards; the DataSet's file it is in, relative to the site's directory, with `/` between
+/// its parts; and the sort key of the last record given from it.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+struct CopyPlace {
+    #[serde(rename = "s")]
+    store: String,
+    #[serde(rename = "w")]
+    watermark: u64,
+    #[serde(rename = "f")]
+    file: String,
+    #[serde(rename = "k")]
+    sort_key: String,
+}
+
+impl CopyPlace {
+    fn token(&self) -> anyhow::Result<CopyToken> {
+        use base64::Engine;
+        Ok(CopyToken(
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(self)?),
+        ))
+    }
+
+    /// The place a token says, None if it is not one, e.g. one damaged on its way.
+    fn of(token: &CopyToken) -> Option<CopyPlace> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(&token.0).ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+}
+
+/// The first DataSet's file of the site in dir, by its path relative to dir, which comes after after, or at it too if
+/// inclusive, in the order of their paths' parts, each sorted, so that a full copy walks them in the same order page
+/// after page, reading only the directories on its way, not the whole tree. The journal and the blobs are not
+/// DataSets.
+fn next_data_file(dir: &Path, after: Option<&str>, inclusive: bool) -> anyhow::Result<Option<String>> {
+    let after: Option<Vec<&str>> = after.map(|after| after.split('/').collect());
+    fn walk(
+        dir: &Path,
+        relative: &str,
+        depth: usize,
+        after: Option<&[&str]>,
+        inclusive: bool,
+    ) -> anyhow::Result<Option<String>> {
+        for name in sorted_entries(dir)? {
+            if depth == 0 && (name == JOURNAL || name == BLOBS) {
+                continue;
+            }
+            // Only the entries at or after the place's part at this depth, and below it only those after its next.
+            let below = match after {
+                Some(after) if depth < after.len() => match name.as_str().cmp(after[depth]) {
+                    std::cmp::Ordering::Less => continue,
+                    std::cmp::Ordering::Equal => Some(after),
+                    std::cmp::Ordering::Greater => None,
+                },
+                _ => None,
+            };
+            let path = dir.join(&name);
+            let child = if relative.is_empty() {
+                name.clone()
+            } else {
+                format!("{relative}/{name}")
+            };
+            if path.is_dir() {
+                if let Some(found) = walk(&path, &child, depth + 1, below, inclusive)? {
+                    return Ok(Some(found));
+                }
+            } else if name.ends_with(".jsonl") {
+                let is_the_place = below.is_some_and(|after| after.len() == depth + 1);
+                if !is_the_place || inclusive {
+                    return Ok(Some(child));
+                }
+            }
+        }
+        Ok(None)
+    }
+    walk(dir, "", 0, after.as_deref(), inclusive)
 }
 
 /// The names of the entries of a directory, sorted, none if it is not there.

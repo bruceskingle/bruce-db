@@ -33,6 +33,35 @@ impl Cursor {
     pub const START: Cursor = Cursor(0);
 }
 
+/// What a page of the change feed says, see Backend::changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Feed {
+    /// The changes after since were given, up to the limit, and the peer asks from this cursor next time, the same as
+    /// since if there were none.
+    Next(Cursor),
+    /// since is older than the journal this node keeps, so the changes after it can no longer be given in the order
+    /// stored: the peer makes a full copy, see Backend::copy, and then asks from the cursor that gives.
+    TooFarBehind,
+}
+
+/// Where a full copy has got to, see Backend::copy: a token the peer keeps between pages and passes back unread, e.g. in
+/// a URL, as it is URL safe text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CopyToken(pub String);
+
+/// What a page of a full copy says, see Backend::copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyPage {
+    /// There is more: the peer asks for the next page with this token.
+    More(CopyToken),
+    /// The copy is complete, and the peer catches up with the change feed from this cursor, which brings everything
+    /// changed while it was copied.
+    Done(Cursor),
+    /// The copy took longer than the journal this node keeps, so a change to a part already copied could be missed:
+    /// the peer starts again, keeping what it has, as putting it again changes nothing.
+    Expired,
+}
+
 /// A change, for replication: the record, its sequence number in this node's store, when it was stored, and the peer
 /// it was pulled from, if it was.
 #[derive(Debug, Clone, PartialEq)]
@@ -96,14 +125,27 @@ pub trait Backend: Send + Sync {
     ) -> anyhow::Result<()>;
 
     /// Every change stored after since, in the order stored, up to limit, leaving out those from or originated by
-    /// for_peer, so that a record is not sent back where it came from, returning the cursor to ask from next time.
+    /// for_peer, so that a record is not sent back where it came from, returning the cursor to ask from next time, or,
+    /// if since is older than the journal kept, that the peer is too far behind, and makes a full copy, see copy.
     fn changes(
         &self,
         since: Cursor,
         limit: usize,
         for_peer: Option<&str>,
         visit: &mut dyn FnMut(Change) -> anyhow::Result<()>,
-    ) -> anyhow::Result<Cursor>;
+    ) -> anyhow::Result<Feed>;
+
+    /// A page of a full copy of the store, for a peer too far behind for the change feed, see Feed::TooFarBehind: up
+    /// to limit of its records, from where token says the last page got to, or from the start if None, leaving out
+    /// those from or originated by for_peer, as changes does. Each record is given as a Change, with the sequence number
+    /// it was stored with, and a peer puts them as it puts changes. See the design's "The journal by the hour".
+    fn copy(
+        &self,
+        token: Option<&CopyToken>,
+        limit: usize,
+        for_peer: Option<&str>,
+        visit: &mut dyn FnMut(Change) -> anyhow::Result<()>,
+    ) -> anyhow::Result<CopyPage>;
 
     /// The hash keys of the DataSets which start with prefix, e.g. every device's `climate.period` of a site.
     fn data_sets(&self, prefix: &str) -> anyhow::Result<Vec<String>>;

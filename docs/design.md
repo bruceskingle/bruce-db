@@ -212,7 +212,10 @@ parts as the path, holding one file, or, for a series, a file a day.
   on the disk, e.g. with a bit flipped by a failing SD card, is found when it is read, even if it is still JSON. A line
   which can not be read, not UTF-8, not JSON or not as its checksum says, is skipped with a warning, and the rest of
   the file read on from the next newline, so that the damage is only that line's; one without a checksum, written
-  before 0.3.0, is taken as it is.
+  before 0.3.0, is taken as it is. A record whose line is damaged is missing, even when the line was indexed before
+  it was damaged, so that a read gives none rather than an error, and compaction goes on without it; and a copy of the
+  same version, e.g. sent again by a peer, is stored in its place, so that a peer can repair it, see "Repair" in
+  Replication.
 - **The journal is the only file written as records arrive**: appends and, unless the caller says otherwise, see
   `Store::set_sync`, a sync after each, so that a crash loses at most the line being written. Each line has `n`, its
   sequence number in the node's store, one more than the last, which orders the change feed and is the replication
@@ -382,6 +385,14 @@ flowchart LR
 - **A node serving changes keeps no state about its clients.** Each request carries all that is needed, its cursor; a
   node never remembers its peers' cursors, nor waits for them, e.g. to compact only what every peer has read, which
   would work for a handful of nodes but ties them together.
+- **Repair**, planned: a line damaged on a node's disk is missing there, see the checksum in [Layout on
+  disk](#layout-on-disk), but its peers have the record, and the feed will not send it again, as the node's cursors
+  are past it. So the store notes each place where it found a damaged line, a DataSet's file or a journal hour, in a
+  file of its own which does not replicate, `Store::damaged`, and the application asks a peer for that place again:
+  for a DataSet's file, a copy of that file alone; for a journal hour, the peer's changes again from the cursor it had
+  for that peer when the hour began. Neither leaves out what the node asking made, as the feed for a peer does, as
+  that is what it may have lost. What comes back is the same version as the damaged line, which a put stores in its
+  place, so the next compaction writes the file whole, and the place is marked repaired once a peer has answered.
 - **Who fetches what is the application's choice**, e.g. every node samples a local source, so that any one keeps going
   alone, while one node owns each internet source, to spare its rate limits, and the others get its records by
   replication.
@@ -422,15 +433,23 @@ The change feed then has two paths, and an answer for the gap between them, neve
 
 - **Catching up**, a `since` within the journal kept: the node finds the hour file holding `since`, by its first line,
   and reads forward. It may give a version since superseded, which is harmless, as the newest version wins.
-- **Too far behind**, a `since` older than the oldest hour kept: the answer says so, and the peer makes a full copy.
-- **A full copy** walks the compacted files in their own order, DataSet by DataSet, file by file, in sort key order,
-  having first taken the node's latest sequence number as its watermark. Its cursor carries the watermark and where it
-  has got to, a DataSet, a file and the last sort key given, so each page reads only that page, and a file rewritten
-  under it is picked up at the right place. When it is done, the peer catches up from the watermark, which brings
-  anything changed meanwhile, including a record moved into a file the walk had passed. Each page first checks that
-  the watermark is still within the journal kept, and if it is not, answers that the copy has expired and must start
-  again: the peer keeps what it has, as putting it again changes nothing, but a change to a file already passed could
-  otherwise be lost. The cursor becomes a token the peer passes back unread, rather than a number.
+- **Too far behind**, a `since` older than the oldest hour kept, or one which the hours kept do not reach from without
+  a gap, e.g. an hour lost from a failing SD card: the answer says so, and the peer makes a full copy. The node knows
+  each kept hour's first and last sequence numbers, reading each once, its first line and its last, and again only
+  when it grows, and the journal's own, and checks that together they hold every one from `since` to the newest
+  compacted. An hour put to again after the clock was set back is taken as holding everything between its first and
+  last lines, which the hours after it do.
+- **A full copy**, `copy`, built for 0.4.0, walks the DataSets' files in the order of their paths, each in sort key
+  order, having first taken the newest sequence number compacted as its watermark, or one before the journal's first
+  line, if that is earlier, as after the clock was set back: not the node's latest, as what is still in the journal is
+  not in the files, and comes from catching up after it. Its token carries the store's ID, the watermark and where it
+  has got to, a file and the last sort key given, so each page reads only that page, reading only the directories on its
+  way to the file, and a file rewritten under it is picked up at the right place, by bisection. When it is done, the
+  peer catches up from the watermark, which brings the journal's records and anything changed meanwhile, including a
+  record moved into a file the walk had passed. Each page first checks that the journal, kept or not, still holds every
+  change after the watermark, with no gap, and if it does not, or the token is of another store, answers that the copy
+  has expired and must start again: the peer keeps what it has, as putting it again changes nothing, but a change to a
+  file already passed could otherwise be lost. The token is URL safe text, which the peer passes back unread.
 
 ### Volumes
 
@@ -516,9 +535,13 @@ feature later, for computers only.
    before, but only once, as the store then keeps each file's sequence numbers and offsets, 16 bytes a line, while it
    has any the peer still wants, so that the pages after the first take milliseconds. Still to do: the answer for
    being too far behind, for which the full copy is needed.
-7. The full copy, with its watermark.
-8. Volumes.
-9. Later: Security Contexts, DynamoDB, the space used.
+7. Done, 23 November 2026, for 0.4.0: the full copy, with its watermark, and the change feed's answer for a peer too
+   far behind, `Feed::TooFarBehind`, in place of reading the DataSets' files, which 0.3.0 did, so that nothing reads
+   the whole store but a copy, once.
+8. Repair: the places where damaged lines were found, and a copy of one place, so that a peer's copy replaces them,
+   see "Repair". Done for 0.4.0: a damaged line is taken as missing, and a copy of the same version replaces it.
+9. Volumes.
+10. Later: Security Contexts, DynamoDB, the space used.
 
 ## Open questions
 

@@ -1,5 +1,30 @@
 # ChangeLog
 
+# Release 0.4.0
+
+## New
+
+- **The full copy,** `Store::copy`, for a peer further behind than the journal kept, e.g. a new device: a page at a
+  time of the DataSets' files, every record once, with a `CopyToken` the peer passes back for the next page, then
+  `CopyPage::Done` with the cursor to catch up from with the change feed, which brings what changed while it copied.
+  A copy which outlasts the journal kept, or is of a store since replaced, answers `CopyPage::Expired`, and is started
+  again.
+- **A gap in the journal kept is found,** e.g. an hour lost from a failing SD card: a peer whose catch-up would cross
+  it is told it is too far behind, and copies instead, rather than missing the changes in it without knowing.
+
+## Improved
+
+- The change feed, `Store::changes`, answers `Feed::TooFarBehind` for a cursor older than the journal kept, rather
+  than reading every DataSet's file to find the changes after it, which took minutes on a device for its first page.
+  It returns `Feed::Next` with the cursor otherwise. This changes its signature: callers make a full copy when they are
+  too far behind.
+
+## Fixed
+
+- **A record whose line is damaged on the disk is missing,** not an error, even when the store had read the line
+  before it was damaged, and compaction goes on without it, rather than failing until the hour is deleted. The same
+  version of the record put again, e.g. sent by a peer, is stored in its place, so that a peer's copy repairs it.
+
 # Release 0.3.0
 
 ## New

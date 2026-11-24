@@ -28,6 +28,20 @@ impl Drop for TestDir {
     }
 }
 
+/// The cursor a page of the change feed gives, for tests of a peer within the journal kept.
+trait NextCursor {
+    fn cursor(self) -> Cursor;
+}
+
+impl NextCursor for Feed {
+    fn cursor(self) -> Cursor {
+        match self {
+            Feed::Next(cursor) => cursor,
+            Feed::TooFarBehind => panic!("too far behind"),
+        }
+    }
+}
+
 fn site() -> Id {
     Id::of(&json!({"site": "test"})).unwrap()
 }
@@ -249,7 +263,8 @@ fn changes_are_given_in_the_order_stored_from_a_cursor_and_not_back_to_their_pee
                 found.push(change.item.attributes.unwrap()["n"].as_i64().unwrap());
                 Ok(())
             })
-            .unwrap();
+            .unwrap()
+            .cursor();
         (found, cursor)
     };
     let (all, end) = collect(&store, Cursor::START, 100, None);
@@ -586,7 +601,8 @@ fn changes_page_one_at_a_time_through_compacted_files_and_the_journal() {
                 found.push((change.sequence, change.item.attributes.unwrap()["s"].as_i64().unwrap()));
                 Ok(())
             })
-            .unwrap();
+            .unwrap()
+            .cursor();
         if next == cursor {
             break;
         }
@@ -629,7 +645,8 @@ fn a_change_goes_over_the_feed_as_a_line_and_comes_back_the_same() {
             changes.push(change);
             Ok(())
         })
-        .unwrap();
+        .unwrap()
+        .cursor();
     let json = changes[0].to_json().unwrap();
     assert_eq!(json["hk"], json!(hk));
     assert_eq!(json["from"], json!("dev1"));
@@ -707,7 +724,8 @@ fn a_garbled_line_is_skipped_and_the_rest_of_the_store_still_works() {
             changed.push(change);
             Ok(())
         })
-        .unwrap();
+        .unwrap()
+        .cursor();
     assert_eq!(changed.len(), 2, "the garbled records are not changes");
     let tomorrow = Micros::now().date().unwrap().next_day().unwrap();
     store.compact(tomorrow).unwrap();
@@ -722,7 +740,8 @@ fn sequences(store: &Store, since: u64, limit: usize) -> (Vec<u64>, u64) {
             found.push(change.sequence);
             Ok(())
         })
-        .unwrap();
+        .unwrap()
+        .cursor();
     (found, cursor.0)
 }
 
@@ -790,11 +809,247 @@ fn the_journal_is_kept_by_the_hour_and_a_peer_behind_catches_up_from_the_hours_k
     store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
     assert_eq!(sequences(&store, 4, 4), (vec![5, 6, 7], 7));
 
-    // Once the kept hours have gone, after the retention, the DataSets' files give the same changes.
+    // Once the kept hours have gone, after the retention, a peer behind them is too far behind, and copies instead, see
+    // a_peer_too_far_behind_copies_the_store_a_page_at_a_time_then_catches_up; one which has everything is not.
     std::fs::remove_dir_all(site_dir.join("journal/kept")).unwrap();
-    assert_eq!(sequences(&store, 0, 4), (vec![1, 2, 3, 4], 4));
-    assert_eq!(sequences(&store, 4, 4), (vec![5, 6, 7], 7));
+    let feed = store.changes(Cursor(4), 4, None, &mut |_| Ok(())).unwrap();
+    assert_eq!(feed, Feed::TooFarBehind);
     assert_eq!(sequences(&store, 7, 4), (vec![], 7));
+}
+
+/// Every page of a full copy, until it is done, as a peer takes them, with the sort keys given and the cursor to catch
+/// up from.
+fn copy_all(store: &Store, limit: usize, peer: Option<&str>) -> (Vec<String>, Cursor) {
+    let mut found = Vec::new();
+    let mut token = None;
+    loop {
+        let page = store
+            .copy(token.as_ref(), limit, peer, &mut |change| {
+                found.push(change.item.sk.clone());
+                Ok(())
+            })
+            .unwrap();
+        match page {
+            CopyPage::More(next) => token = Some(next),
+            CopyPage::Done(cursor) => return (found, cursor),
+            CopyPage::Expired => panic!("expired"),
+        }
+    }
+}
+
+/// A peer further behind than the kept journal, e.g. a new device, copies the store's DataSets' files a page at a
+/// time, every record once, then catches up from the watermark the copy gives, which brings what was put while it
+/// copied, even into a file it had passed, and what was still in the journal when it started.
+#[test]
+fn a_peer_too_far_behind_copies_the_store_a_page_at_a_time_then_catches_up() {
+    let dir = TestDir::new("full-copy");
+    let store = open(&dir);
+    let tesla = store.hash_key("tesla.snapshot", &[Part::from("gw")]).unwrap();
+    let zappi = store.hash_key("myenergi.zappi", &[Part::from("z1")]).unwrap();
+    let mut seconds = 0;
+    let mut put = |store: &Store, hk: &str, sk: &str| {
+        seconds += 1;
+        store
+            .put(&Item::new(hk, sk, version(seconds, "dev"), json!({"s": seconds})))
+            .unwrap();
+    };
+    for day in 1..=3 {
+        for hour in 0..3 {
+            put(&store, &tesla, &format!("2026-11-0{day}T0{hour}:00:00Z"));
+            put(&store, &zappi, &format!("2026-11-0{day}T0{hour}:30:00Z"));
+        }
+    }
+    put(&store, &zappi, "settings");
+    store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
+    // Put after compaction, so still in the journal when the copy starts.
+    put(&store, &tesla, "2026-11-04T00:00:00Z");
+    let site_dir = dir.0.join(site().hex());
+    std::fs::remove_dir_all(site_dir.join("journal/kept")).unwrap();
+    assert_eq!(
+        store.changes(Cursor::START, 10, None, &mut |_| Ok(())).unwrap(),
+        Feed::TooFarBehind
+    );
+
+    // Pages of 4, the first two pages, then a record changed in a file already passed, and one added.
+    let mut found = Vec::new();
+    let mut token = None;
+    for _ in 0..2 {
+        match store
+            .copy(token.as_ref(), 4, None, &mut |change| {
+                found.push(change.item.sk.clone());
+                Ok(())
+            })
+            .unwrap()
+        {
+            CopyPage::More(next) => token = Some(next),
+            page => panic!("not more: {page:?}"),
+        }
+    }
+    assert_eq!(found.len(), 8);
+    let passed = found[0].clone();
+    let first_hk = if passed.ends_with(":30:00Z") || passed == "settings" {
+        &zappi
+    } else {
+        &tesla
+    };
+    put(&store, first_hk, &passed);
+    put(&store, &tesla, "2026-11-05T00:00:00Z");
+    let watermark = loop {
+        match store
+            .copy(token.as_ref(), 4, None, &mut |change| {
+                found.push(change.item.sk.clone());
+                Ok(())
+            })
+            .unwrap()
+        {
+            CopyPage::More(next) => token = Some(next),
+            CopyPage::Done(cursor) => break cursor,
+            CopyPage::Expired => panic!("expired"),
+        }
+    };
+    let mut copied = found.clone();
+    copied.sort();
+    copied.dedup();
+    assert_eq!(copied.len(), found.len(), "each record once");
+    assert_eq!(found.len(), 19, "every compacted record, and none of the journal's");
+    assert_eq!(watermark, Cursor(19), "the newest compacted");
+
+    // Catching up from the watermark brings the journal's, and those put while copying.
+    let mut later = Vec::new();
+    let feed = store
+        .changes(watermark, 100, None, &mut |change| {
+            later.push(change.item.sk.clone());
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(feed, Feed::Next(Cursor(22)));
+    assert_eq!(
+        later,
+        vec![
+            "2026-11-04T00:00:00Z".to_string(),
+            passed.clone(),
+            "2026-11-05T00:00:00Z".to_string()
+        ]
+    );
+
+    // A copy in pages of 1, or all at once, gives the same records.
+    let (one_by_one, cursor) = copy_all(&store, 1, None);
+    assert_eq!(cursor, Cursor(19));
+    let (at_once, _) = copy_all(&store, 1000, None);
+    assert_eq!(one_by_one, at_once);
+    assert_eq!(at_once.len(), 19);
+}
+
+/// A copy leaves out what came from or was made by the peer asking, as the change feed does, and one which outlasts
+/// the kept journal, or whose token is of another store, or damaged, expires, so that the peer starts again.
+#[test]
+fn a_copy_leaves_out_the_peers_own_and_expires_when_the_journal_kept_has_moved_past_it() {
+    let dir = TestDir::new("copy-expires");
+    let store = open(&dir);
+    let hk = store.hash_key("tesla.snapshot", &[Part::from("gw")]).unwrap();
+    for index in 0..4 {
+        let origin = if index % 2 == 0 { "dev" } else { "peer" };
+        store
+            .put(&Item::new(
+                &hk,
+                &format!("2026-11-01T00:00:0{index}Z"),
+                version(index + 1, origin),
+                json!({"i": index}),
+            ))
+            .unwrap();
+    }
+    store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
+    let (found, _) = copy_all(&store, 10, Some("peer"));
+    assert_eq!(found, vec!["2026-11-01T00:00:00Z", "2026-11-01T00:00:02Z"]);
+
+    let CopyPage::More(token) = store.copy(None, 1, None, &mut |_| Ok(())).unwrap() else {
+        panic!("more");
+    };
+    // Compacted further, and the kept hours gone, so the change feed can no longer reach back to the watermark.
+    store
+        .put(&Item::new(&hk, "2026-11-02T00:00:00Z", version(9, "dev"), json!({})))
+        .unwrap();
+    store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
+    std::fs::remove_dir_all(dir.0.join(site().hex()).join("journal/kept")).unwrap();
+    assert_eq!(
+        store.copy(Some(&token), 1, None, &mut |_| Ok(())).unwrap(),
+        CopyPage::Expired
+    );
+    assert_eq!(
+        store
+            .copy(Some(&CopyToken("not a token".into())), 1, None, &mut |_| Ok(()))
+            .unwrap(),
+        CopyPage::Expired
+    );
+    // Started again, it completes.
+    assert_eq!(copy_all(&store, 2, None).0.len(), 5);
+}
+
+/// An hour lost from the middle of the kept journal, e.g. by a failing SD card, leaves a gap which a peer behind it
+/// would skip without knowing: so the change feed says it is too far behind, and a copy whose catch-up would cross the
+/// gap expires, while a peer after the gap catches up as before.
+#[test]
+fn an_hour_missing_from_the_kept_journal_is_a_gap_which_no_peer_catches_up_across() {
+    let dir = TestDir::new("kept-gap");
+    let store = open(&dir);
+    let hk = store.hash_key("tesla.snapshot", &[Part::from("gw")]).unwrap();
+    let put = |index: i64| {
+        store
+            .put(&Item::new(
+                &hk,
+                &format!("2026-11-01T00:00:{index:02}Z"),
+                version(index, "dev"),
+                json!({"i": index}),
+            ))
+            .unwrap();
+    };
+    for index in 1..=3 {
+        put(index);
+    }
+    store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
+    // A copy started now has 3 as its watermark, and catches up across what is compacted after it.
+    let CopyPage::More(token) = store.copy(None, 1, None, &mut |_| Ok(())).unwrap() else {
+        panic!("more");
+    };
+    for index in 4..=9 {
+        put(index);
+    }
+    store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
+    put(10);
+
+    // The kept hour, holding 1 to 9, split into three hours of three, as if kept over three hours.
+    let kept = dir.0.join(site().hex()).join("journal/kept");
+    let names: Vec<_> = std::fs::read_dir(&kept)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    assert_eq!(names.len(), 1);
+    let text = std::fs::read_to_string(&names[0]).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 9);
+    std::fs::remove_file(&names[0]).unwrap();
+    for (hour, three) in lines.chunks(3).enumerate() {
+        std::fs::write(kept.join(format!("2026-11-20T0{hour}.jsonl")), three.join("\n") + "\n").unwrap();
+    }
+    assert_eq!(sequences(&store, 0, 100), ((1..=10).collect::<Vec<_>>(), 10));
+    assert_eq!(sequences(&store, 2, 3), (vec![3, 4, 5], 5));
+
+    // The middle hour, 4 to 6, lost.
+    std::fs::remove_file(kept.join("2026-11-20T01.jsonl")).unwrap();
+    for since in [0, 2, 3, 5] {
+        let feed = store.changes(Cursor(since), 100, None, &mut |_| Ok(())).unwrap();
+        assert_eq!(feed, Feed::TooFarBehind, "from {since}");
+    }
+    assert_eq!(sequences(&store, 6, 100), (vec![7, 8, 9, 10], 10));
+    assert_eq!(
+        store.copy(Some(&token), 1, None, &mut |_| Ok(())).unwrap(),
+        CopyPage::Expired
+    );
+    // Started again, its watermark is the newest compacted, after the gap, so it completes, and catches up.
+    let (found, cursor) = copy_all(&store, 4, None);
+    assert_eq!((found.len(), cursor), (9, Cursor(9)));
+    assert_eq!(sequences(&store, cursor.0, 100), (vec![10], 10));
 }
 
 /// A store of the layout before, with a journal a file a day, is read and compacted as it is, and marked as of this
@@ -958,4 +1213,212 @@ fn a_query_finds_its_start_in_files_of_long_and_short_lines() {
             assert_eq!(found, (from..to).map(sk).collect::<Vec<_>>(), "from {from} to {to}");
         }
     }
+}
+
+/// A copy with compaction rewriting the files under it after every page, and puts to old and new records meanwhile,
+/// still leaves the peer, once it has caught up from the watermark, with every record at its newest version.
+#[test]
+fn a_copy_with_compaction_under_it_and_its_catch_up_give_every_record_as_it_is_now() {
+    let dir = TestDir::new("copy-compacting");
+    let store = open(&dir);
+    let hk = store.hash_key("tesla.snapshot", &[Part::from("gw")]).unwrap();
+    let mut seconds = 0;
+    let mut put = |store: &Store, sk: &str| {
+        seconds += 1;
+        store
+            .put(&Item::new(&hk, sk, version(seconds, "dev"), json!({"s": seconds})))
+            .unwrap();
+    };
+    let later = Micros(Micros::now().0 + 3_600_000_000);
+    for day in 1..=4 {
+        for minute in 0..5 {
+            put(&store, &format!("2026-11-0{day}T00:0{minute}:00Z"));
+        }
+    }
+    store.compact_through(later).unwrap();
+
+    let mut peer: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    let mut take = |change: Change| {
+        let s = change.item.attributes.unwrap()["s"].as_i64().unwrap();
+        let newest = peer.entry(change.item.sk.clone()).or_insert(s);
+        *newest = (*newest).max(s);
+        Ok(())
+    };
+    let mut token = None;
+    let mut page = 0;
+    let watermark = loop {
+        match store.copy(token.as_ref(), 3, None, &mut take).unwrap() {
+            CopyPage::More(next) => token = Some(next),
+            CopyPage::Done(cursor) => break cursor,
+            CopyPage::Expired => panic!("expired"),
+        }
+        // A record before the copy's place, one after it, and a new day, then compacted, rewriting their files.
+        page += 1;
+        put(&store, "2026-11-01T00:00:00Z");
+        put(&store, &format!("2026-11-04T00:0{}:00Z", page % 5));
+        put(&store, &format!("2026-11-{:02}T00:00:00Z", 10 + page));
+        store.compact_through(later).unwrap();
+    };
+    let mut cursor = watermark;
+    loop {
+        match store.changes(cursor, 4, None, &mut take).unwrap() {
+            Feed::Next(next) if next == cursor => break,
+            Feed::Next(next) => cursor = next,
+            Feed::TooFarBehind => panic!("too far behind"),
+        }
+    }
+    let now: std::collections::BTreeMap<String, i64> = store
+        .all(&hk)
+        .unwrap()
+        .into_iter()
+        .map(|item| (item.sk, item.attributes.unwrap()["s"].as_i64().unwrap()))
+        .collect();
+    assert!(page > 3, "several pages, with compaction between");
+    assert_eq!(peer, now);
+}
+
+/// A record whose line is damaged on the card, e.g. bits flipped, fails its checksum and is skipped, so the store has
+/// it no longer, and the same record sent again by a peer is stored, and replaces the damaged line when compacted.
+#[test]
+fn a_record_damaged_on_the_card_is_replaced_by_the_same_record_from_a_peer() {
+    let dir = TestDir::new("damaged");
+    let hk;
+    let item;
+    let file;
+    {
+        let store = open(&dir);
+        hk = store.hash_key("tesla.snapshot", &[Part::from("gw")]).unwrap();
+        for index in 1..=3 {
+            store
+                .put(&Item::new(
+                    &hk,
+                    &format!("2026-11-01T00:00:0{index}Z"),
+                    version(index, "dev"),
+                    json!({"value": index}),
+                ))
+                .unwrap();
+        }
+        item = store.get(&hk, "2026-11-01T00:00:02Z").unwrap().unwrap();
+        store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
+        let site_dir = dir.0.join(site().hex());
+        file = walk(&site_dir)
+            .into_iter()
+            .find(|path| {
+                path.extension().is_some_and(|extension| extension == "jsonl")
+                    && !path.to_string_lossy().contains("journal")
+            })
+            .unwrap();
+    }
+    // A digit of the middle record's value changed, as a flipped bit would.
+    let text = std::fs::read_to_string(&file).unwrap();
+    let damaged = text.replace(r#""value":2"#, r#""value":7"#);
+    assert_ne!(text, damaged);
+    std::fs::write(&file, damaged).unwrap();
+
+    let store = open(&dir);
+    assert_eq!(
+        store.get(&hk, "2026-11-01T00:00:02Z").unwrap(),
+        None,
+        "the damaged line is skipped"
+    );
+    assert_eq!(store.put_from(&item, "peer").unwrap(), Put::Stored);
+    assert_eq!(store.get(&hk, "2026-11-01T00:00:02Z").unwrap(), Some(item.clone()));
+    store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
+    assert_eq!(store.all(&hk).unwrap().len(), 3);
+    assert_eq!(store.get(&hk, "2026-11-01T00:00:02Z").unwrap(), Some(item));
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(!text.contains(r#""value":7"#), "the damaged line is gone");
+}
+
+/// A record's line damaged while the store is open, with its index already read, in a compacted file, without its
+/// size or time changing, as bits flipped on an SD card would, or in the journal, is taken as missing, not an error,
+/// and the same record sent again by a peer replaces it; compaction goes on without a damaged journal line.
+#[test]
+fn a_record_damaged_while_the_store_is_open_is_missing_and_replaced_by_a_peers_copy() {
+    let dir = TestDir::new("damaged-open");
+    let store = open(&dir);
+    let hk = store.hash_key("tesla.snapshot", &[Part::from("gw")]).unwrap();
+    let put = |index: i64| {
+        let item = Item::new(
+            &hk,
+            &format!("2026-11-01T00:00:0{index}Z"),
+            version(index, "dev"),
+            json!({"value": index}),
+        );
+        store.put(&item).unwrap();
+        item
+    };
+    let items: Vec<Item> = (1..=3).map(put).collect();
+    store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
+    assert_eq!(store.get(&hk, &items[1].sk).unwrap(), Some(items[1].clone()));
+    let site_dir = dir.0.join(site().hex());
+    let file = walk(&site_dir)
+        .into_iter()
+        .find(|path| {
+            path.extension().is_some_and(|extension| extension == "jsonl")
+                && !path.to_string_lossy().contains("journal")
+        })
+        .unwrap();
+    let damage = |path: &std::path::Path, from: &str, to: &str| {
+        let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(text.contains(from));
+        std::fs::write(path, text.replace(from, to)).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+    };
+
+    // In a compacted file.
+    damage(&file, r#""value":2"#, r#""value":7"#);
+    assert_eq!(store.get(&hk, &items[1].sk).unwrap(), None);
+    assert_eq!(store.put_from(&items[1], "peer").unwrap(), Put::Stored);
+    assert_eq!(store.get(&hk, &items[1].sk).unwrap(), Some(items[1].clone()));
+    // Sent again, now that it is whole, it is a copy already held.
+    assert_eq!(store.put_from(&items[1], "peer").unwrap(), Put::Older);
+
+    // In the journal: a record put since, then damaged, which compaction leaves out, and a peer's copy restores.
+    let fourth = put(4);
+    let journal = walk(&site_dir.join("journal"))
+        .into_iter()
+        .find(|path| !path.to_string_lossy().contains("kept") && path.to_string_lossy().ends_with(".jsonl"))
+        .unwrap();
+    damage(&journal, r#""value":4"#, r#""value":8"#);
+    assert_eq!(store.get(&hk, &fourth.sk).unwrap(), None);
+    assert_eq!(store.put_from(&fourth, "peer").unwrap(), Put::Stored);
+    assert_eq!(store.get(&hk, &fourth.sk).unwrap(), Some(fourth.clone()));
+    store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
+    assert_eq!(store.all(&hk).unwrap().len(), 4);
+    assert_eq!(store.get(&hk, &fourth.sk).unwrap(), Some(fourth));
+    assert_eq!(store.get(&hk, &items[1].sk).unwrap(), Some(items[1].clone()));
+
+    // A journal line damaged with no copy sent: compaction goes on without it, and a copy sent later is stored.
+    let fifth = put(5);
+    let journal = walk(&site_dir.join("journal"))
+        .into_iter()
+        .find(|path| !path.to_string_lossy().contains("kept") && path.to_string_lossy().ends_with(".jsonl"))
+        .unwrap();
+    damage(&journal, r#""value":5"#, r#""value":9"#);
+    store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
+    assert_eq!(store.all(&hk).unwrap().len(), 4);
+    assert_eq!(store.get(&hk, &fifth.sk).unwrap(), None);
+    assert_eq!(store.put_from(&fifth, "peer").unwrap(), Put::Stored);
+    assert_eq!(store.get(&hk, &fifth.sk).unwrap(), Some(fifth));
+}
+
+/// Every file under dir.
+fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            found.extend(walk(&path));
+        } else {
+            found.push(path);
+        }
+    }
+    found
 }

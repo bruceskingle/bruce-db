@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use anyhow::bail;
 
-pub use backend::{Backend, Change, Cursor, Flow, Put};
+pub use backend::{Backend, Change, CopyPage, CopyToken, Cursor, Feed, Flow, Put};
 /// Progress and cancellation of long work, e.g. compaction, see bruce-util-progress.
 pub use bruce_util_progress as progress;
 pub use file::FileBackend;
@@ -120,14 +120,26 @@ impl Store {
         self.query_all(hk, ALL)
     }
 
+    /// A page of the change feed, see Backend::changes.
     pub fn changes(
         &self,
         since: Cursor,
         limit: usize,
         for_peer: Option<&str>,
         visit: &mut dyn FnMut(Change) -> anyhow::Result<()>,
-    ) -> anyhow::Result<Cursor> {
+    ) -> anyhow::Result<Feed> {
         self.backend.changes(since, limit, for_peer, visit)
+    }
+
+    /// A page of a full copy, for a peer too far behind for the change feed, see Backend::copy.
+    pub fn copy(
+        &self,
+        token: Option<&CopyToken>,
+        limit: usize,
+        for_peer: Option<&str>,
+        visit: &mut dyn FnMut(Change) -> anyhow::Result<()>,
+    ) -> anyhow::Result<CopyPage> {
+        self.backend.copy(token, limit, for_peer, visit)
     }
 
     pub fn data_sets(&self, prefix: &str) -> anyhow::Result<Vec<String>> {

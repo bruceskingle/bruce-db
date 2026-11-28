@@ -21,10 +21,7 @@ pub struct Id(String);
 impl Id {
     /// The ID of value, which must follow the rules, see check.
     pub fn of(value: &Value) -> anyhow::Result<Id> {
-        check(value, "")?;
-        let canonical = serde_jcs::to_string(&normalise(value, "")?)
-            .map_err(|error| anyhow!("Unable to make canonical JSON, {error}"))?;
-        Ok(Id::of_bytes(canonical.as_bytes()))
+        Ok(Id::of_bytes(canonical(value)?.as_bytes()))
     }
 
     /// The ID of bytes, e.g. a blob's contents, see blob.rs.
@@ -81,6 +78,13 @@ pub fn is_id(text: &str) -> bool {
         && base64::engine::general_purpose::URL_SAFE_NO_PAD
             .decode(text)
             .is_ok_and(|bytes| bytes.len() == 32)
+}
+
+/// The canonical JSON of value, as an ID is made from it, see Id::of, which must follow the same rules, e.g. for what
+/// a principal signs, see security.rs, so that every node signs and checks the same bytes.
+pub(crate) fn canonical(value: &Value) -> anyhow::Result<String> {
+    check(value, "")?;
+    serde_jcs::to_string(&normalise(value, "")?).map_err(|error| anyhow!("Unable to make canonical JSON, {error}"))
 }
 
 /// Checks that value follows the rules for what an ID is made from, saying where it does not, at path.

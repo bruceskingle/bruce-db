@@ -27,3 +27,6 @@ serde_jcs = "0.2"
 unicode-normalization = "0.1"
 sha2 = "0.10"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+ed25519-dalek = { version = "2", default-features = false, features = ["std", "zeroize"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+getrandom = "0.2"

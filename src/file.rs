@@ -1,10 +1,10 @@
-//! The file backend, see the design's layout on disk: a site's directory holds a journal, a file an hour of every put
+//! The file backend, see the design's layout on disk: a domain's directory holds a journal, a file an hour of every put
 //! in the order it arrived, the DataSets' files, into which compaction folds the finished journal hours, one line for
 //! each record, ordered by sort key, and the blobs. Stores made before kept the journal a file a day, which are read
 //! and compacted as they are, as a day's file sorts before its hours'.
 //!
 //! ```text
-//! <site hex>/
+//! <domain hex>/
 //!   journal/2026-11-04T07.jsonl  every put of an hour, as it arrived
 //!   journal/kept/                the journal's hours once compacted, kept a while for peers catching up, see Retention
 //!   format.json                  the layout's version, see FORMAT
@@ -42,8 +42,8 @@ const JOURNAL: &str = "journal";
 const KEPT: &str = "kept";
 const BLOBS: &str = "blobs";
 const STATE: &str = "state.json";
-/// The file which says which version of this layout a site's directory is, see the design's versions of formats: 2,
-/// with the journal by the hour, its compacted files kept, and each line's checksum; a site without one is 1, which
+/// The file which says which version of this layout a domain's directory is, see the design's versions of formats: 2,
+/// with the journal by the hour, its compacted files kept, and each line's checksum; a domain without one is 1, which
 /// this reads as it is.
 const FORMAT_FILE: &str = "format.json";
 const FORMAT: u64 = 2;
@@ -69,7 +69,7 @@ struct Indexed {
     again: bool,
 }
 
-/// What the site's directory keeps of its own.
+/// What the domain's directory keeps of its own.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 struct State {
     /// The store's ID, made when it is first opened, so that a peer can tell when a node's store is a new one, e.g. a
@@ -201,7 +201,7 @@ enum Location {
     File { path: PathBuf, offset: u64 },
 }
 
-/// A site's store in files, see the module documentation.
+/// A domain's store in files, see the module documentation.
 pub struct FileBackend {
     dir: PathBuf,
     inner: Mutex<Inner>,
@@ -237,14 +237,14 @@ const COMPACTED_FILES: usize = 8;
 const COMPACTED_FILES: usize = 2;
 
 impl FileBackend {
-    /// Copies the site from, in root, a directory of sites, as the new site to, e.g. for a copy of a profile, see
-    /// Store::copy_site: each line of its journal and files with its hash key's site changed to to, and the rest of its
-    /// files, its blobs and state, as they are, but for the store's ID, which the copy makes its own. It fails if to's
-    /// directory is there already, rather than mixing them.
-    pub fn copy_site(root: &Path, from: &Id, to: &Id) -> anyhow::Result<()> {
+    /// Copies the domain from, in root, a directory of domains, as the new domain to, e.g. for a copy of a profile, see
+    /// Store::copy_domain: each line of its journal and files with its hash key's domain changed to to, and the rest of
+    /// its files, its blobs and state, as they are, but for the store's ID, which the copy makes its own. It fails if
+    /// to's directory is there already, rather than mixing them.
+    pub fn copy_domain(root: &Path, from: &Id, to: &Id) -> anyhow::Result<()> {
         let (source, target) = (root.join(from.hex()), root.join(to.hex()));
         if target.exists() {
-            bail!("The site {to} is in the store already");
+            bail!("The domain {to} is in the store already");
         }
         let (from_prefix, to_prefix) = (format!("{from}/"), format!("{to}/"));
         let mut dirs = vec![PathBuf::new()];
@@ -277,9 +277,9 @@ impl FileBackend {
         Ok(())
     }
 
-    /// The store of the site in root, a directory of sites, made if it is not there.
-    pub fn open(root: &Path, site: &Id) -> anyhow::Result<FileBackend> {
-        let dir = root.join(site.hex());
+    /// The store of the domain in root, a directory of domains, made if it is not there.
+    pub fn open(root: &Path, domain: &Id) -> anyhow::Result<FileBackend> {
+        let dir = root.join(domain.hex());
         fs::create_dir_all(dir.join(JOURNAL))
             .with_context(|| format!("Unable to make the store's directory {}", dir.display()))?;
         check_format(&dir)?;
@@ -323,7 +323,7 @@ impl FileBackend {
         Ok(backend)
     }
 
-    /// The site's directory.
+    /// The domain's directory.
     pub fn dir(&self) -> &Path {
         &self.dir
     }
@@ -624,7 +624,8 @@ fn journal_line(reader: &mut LineReader, journal: &Path, sk: &str, offset: u64) 
     }
 }
 
-/// A new store's ID, see State::id, made from where and when it was made, as a created thing's is, see the design's IDs.
+/// A new store's ID, see State::id, made from where and when it was made, as a created thing's is, see the design's
+/// IDs.
 fn new_store_id(dir: &Path) -> anyhow::Result<String> {
     // Only ASCII, as IDs are until strings can be normalised, see id.rs.
     let dir: String = dir.to_string_lossy().chars().filter(char::is_ascii).collect();
@@ -640,7 +641,7 @@ fn journal_file(stored: Micros) -> String {
     format!("{}.jsonl", &stored.to_text()[..13])
 }
 
-/// Refuses a site whose layout is of a newer version than this reads, see FORMAT, and marks one made before, or new,
+/// Refuses a domain whose layout is of a newer version than this reads, see FORMAT, and marks one made before, or new,
 /// as this version, as this writes the journal by the hour.
 fn check_format(dir: &Path) -> anyhow::Result<()> {
     let path = dir.join(FORMAT_FILE);
@@ -664,7 +665,7 @@ fn check_format(dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The state of the site in dir, the default if it has none yet.
+/// The state of the domain in dir, the default if it has none yet.
 fn load_state(dir: &Path) -> anyhow::Result<State> {
     restore(&dir.join(STATE));
     match fs::read_to_string(dir.join(STATE)) {
@@ -971,7 +972,7 @@ impl Ord for Pending {
 }
 
 /// Writes a file to a temporary name and renames it over the old, so that a crash leaves one or the other whole.
-fn write_atomically(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_atomically(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1045,7 +1046,8 @@ fn open_replaced(path: &Path) -> std::io::Result<File> {
     }
 }
 
-/// How much of the end of a file is read for its last line, see last_line_head: a Tesla snapshot's line is about 1.2 kB.
+/// How much of the end of a file is read for its last line, see last_line_head: a Tesla snapshot's line is about 1.2
+/// kB.
 const TAIL: u64 = 16 * 1024;
 
 /// The head of the last line of the file of length, None if it has none, or the last is longer than TAIL, or can not
@@ -1141,8 +1143,8 @@ impl Backend for FileBackend {
     }
 
     fn put(&self, item: &Item, from: Option<&str>) -> anyhow::Result<Put> {
-        if key::site_of(&item.hk)?.hex() != self.dir.file_name().and_then(|name| name.to_str()).unwrap_or_default() {
-            bail!("{} is not a hash key of this store's site", item.hk);
+        if key::domain_of(&item.hk)?.hex() != self.dir.file_name().and_then(|name| name.to_str()).unwrap_or_default() {
+            bail!("{} is not a hash key of this store's domain", item.hk);
         }
         key::data_set_dir(&self.dir, &item.hk)?;
         let _lock = JournalLock::take(&self.journal_dir())?;
@@ -1454,20 +1456,20 @@ impl Backend for FileBackend {
                     .map(|hk| hk.to_string()),
             );
         }
-        let site = self
+        let domain = self
             .dir
             .file_name()
             .and_then(|name| name.to_str())
             .map(Id::from_hex)
             .transpose()?;
-        let Some(site) = site else {
+        let Some(domain) = domain else {
             return Ok(found.into_iter().collect());
         };
         let mut dirs: Vec<(PathBuf, String)> = Vec::new();
         for entry in fs::read_dir(&self.dir)?.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
             if entry.path().is_dir() && name != JOURNAL && name != BLOBS && key::is_name(&name) {
-                dirs.push((entry.path(), format!("{site}/{name}")));
+                dirs.push((entry.path(), format!("{domain}/{name}")));
             }
         }
         while let Some((dir, hk)) = dirs.pop() {
@@ -1677,8 +1679,8 @@ impl FileBackend {
 
     /// Offers first the changes after since from the kept journal files, in the order stored, see changes, if the
     /// journal, kept or not, holds every change from since to through, the newest compacted, saying whether it does. If
-    /// it does not, e.g. as the peer is further behind than the retention, or an hour kept has gone missing, the peer is
-    /// too far behind. A kept line may have been superseded since, which is harmless, as the newest version wins.
+    /// it does not, e.g. as the peer is further behind than the retention, or an hour kept has gone missing, the peer
+    /// is too far behind. A kept line may have been superseded since, which is harmless, as the newest version wins.
     fn kept_from(
         &self,
         since: u64,
@@ -1724,8 +1726,8 @@ impl FileBackend {
     }
 
     /// Whether the journal holds every change after since up to through: the kept hours' spans and the journal's own,
-    /// journal, see Journal::span, together, with no gap, e.g. an hour lost from the SD card, so that a peer catching up
-    /// from since misses nothing. An hour put to again after the clock was set back is taken as holding everything
+    /// journal, see Journal::span, together, with no gap, e.g. an hour lost from the SD card, so that a peer catching
+    /// up from since misses nothing. An hour put to again after the clock was set back is taken as holding everything
     /// between its first and last lines, which the hours after it do.
     fn reaches(&self, since: u64, through: u64, journal: Option<(u64, u64)>) -> anyhow::Result<bool> {
         let spans = self.kept_spans()?;
@@ -1736,8 +1738,8 @@ impl FileBackend {
         ))
     }
 
-    /// The kept journal files, by name, each with its first and last sequence numbers, in the order of their first, read
-    /// once, and again only when added to, see kept_spans; none if there are none, e.g. as the store was compacted
+    /// The kept journal files, by name, each with its first and last sequence numbers, in the order of their first,
+    /// read once, and again only when added to, see kept_spans; none if there are none, e.g. as the store was compacted
     /// before files were kept.
     fn kept_spans(&self) -> anyhow::Result<Vec<KeptSpan>> {
         let kept = self.kept_dir();
@@ -1832,7 +1834,7 @@ fn covers(spans: impl Iterator<Item = (u64, u64)>, since: u64, through: u64) -> 
 /// Where a full copy has got to, see FileBackend's copy, which the peer keeps as a CopyToken, this as JSON in URL safe
 /// base64, so that it is passed back unread: the store it is of, so that a token from a store since replaced, e.g. a
 /// wiped card, starts the copy again; the watermark, the newest sequence number compacted when it started, from which
-/// the peer catches up afterwards; the DataSet's file it is in, relative to the site's directory, with `/` between
+/// the peer catches up afterwards; the DataSet's file it is in, relative to the domain's directory, with `/` between
 /// its parts; and the sort key of the last record given from it.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct CopyPlace {
@@ -1862,7 +1864,7 @@ impl CopyPlace {
     }
 }
 
-/// The first DataSet's file of the site in dir, by its path relative to dir, which comes after after, or at it too if
+/// The first DataSet's file of the domain in dir, by its path relative to dir, which comes after after, or at it too if
 /// inclusive, in the order of their paths' parts, each sorted, so that a full copy walks them in the same order page
 /// after page, reading only the directories on its way, not the whole tree. The journal and the blobs are not
 /// DataSets.

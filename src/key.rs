@@ -1,4 +1,4 @@
-//! Hash keys, `<site>/<kind>/<parts>`, and the directories they are kept in, see the design's IDs and layout.
+//! Hash keys, `<domain>/<kind>/<parts>`, and the directories they are kept in, see the design's IDs and layout.
 //!
 //! Each part of a hash key is either an ID, see id.rs, which is a directory named by its hex, or a readable name, of
 //! lowercase letters, digits, `.` and `-`, at most 42 characters, so that it can never be taken for an ID, which is 43,
@@ -50,12 +50,12 @@ pub fn is_name(text: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'-')
 }
 
-/// The hash key of a DataSet of the kind, e.g. `climate.period`, in site, and its parts after the kind, checked.
-pub fn hash_key(site: &Id, kind: &str, parts: &[Part]) -> anyhow::Result<String> {
+/// The hash key of a DataSet of the kind, e.g. `climate.period`, in domain, and its parts after the kind, checked.
+pub fn hash_key(domain: &Id, kind: &str, parts: &[Part]) -> anyhow::Result<String> {
     if !is_name(kind) {
         bail!("{kind} is not a kind: lowercase letters, digits, . and - only");
     }
-    let mut key = format!("{site}/{kind}");
+    let mut key = format!("{domain}/{kind}");
     for part in parts {
         match part {
             Part::Id(id) => key.push_str(&format!("/{id}")),
@@ -68,21 +68,34 @@ pub fn hash_key(site: &Id, kind: &str, parts: &[Part]) -> anyhow::Result<String>
     Ok(key)
 }
 
-/// The site of a hash key, its first part.
-pub fn site_of(hk: &str) -> anyhow::Result<Id> {
+/// The domain of a hash key, its first part.
+pub fn domain_of(hk: &str) -> anyhow::Result<Id> {
     Id::parse(hk.split('/').next().unwrap_or_default())
 }
 
-/// The directory of the DataSet hk, under the site's directory, each part after the site a directory, an ID by its hex.
-pub fn data_set_dir(site_dir: &Path, hk: &str) -> anyhow::Result<PathBuf> {
+/// The kinds which may have very many DataSets, e.g. a company's principals, whose first ID is put in one of 256
+/// directories by its first two hex characters, as git does, as FAT searches a directory one entry at a time, see the
+/// design's "Layout on disk".
+const SPLIT_KINDS: [&str; 2] = ["principal", "directory"];
+
+/// The directory of the DataSet hk, under the domain's directory, each part after the domain a directory, an ID by its
+/// hex, the first ID of a kind in SPLIT_KINDS under the directory of its first two hex characters.
+pub fn data_set_dir(domain_dir: &Path, hk: &str) -> anyhow::Result<PathBuf> {
     let mut parts = hk.split('/');
     parts.next();
-    let mut dir = site_dir.to_path_buf();
+    let split = hk.split('/').nth(1).is_some_and(|kind| SPLIT_KINDS.contains(&kind));
+    let mut dir = domain_dir.to_path_buf();
     let mut any = false;
+    let mut first_id = true;
     for part in parts {
         any = true;
         if is_id(part) {
-            dir.push(Id::parse(part)?.hex());
+            let hex = Id::parse(part)?.hex();
+            if split && first_id {
+                dir.push(&hex[..2]);
+            }
+            first_id = false;
+            dir.push(hex);
         } else if is_name(part) {
             dir.push(part);
         } else {
@@ -126,15 +139,20 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn site() -> Id {
-        Id::of(&json!({"site": "test"})).unwrap()
+    fn domain() -> Id {
+        Id::of(&json!({"domain": "test"})).unwrap()
     }
 
     #[test]
     fn a_hash_key_is_its_site_kind_and_parts_and_ids_are_hex_directories() {
         let meter = Id::of(&json!({"meter": "1"})).unwrap();
-        let hk = hash_key(&site(), "octopus.reading", &[Part::from(&meter), Part::from("import")]).unwrap();
-        assert_eq!(hk, format!("{}/octopus.reading/{meter}/import", site()));
+        let hk = hash_key(
+            &domain(),
+            "octopus.reading",
+            &[Part::from(&meter), Part::from("import")],
+        )
+        .unwrap();
+        assert_eq!(hk, format!("{}/octopus.reading/{meter}/import", domain()));
         let dir = data_set_dir(Path::new("/root"), &hk).unwrap();
         assert_eq!(
             dir,
@@ -143,16 +161,16 @@ mod tests {
                 .join(meter.hex())
                 .join("import")
         );
-        assert_eq!(site_of(&hk).unwrap(), site());
+        assert_eq!(domain_of(&hk).unwrap(), domain());
     }
 
     #[test]
     fn names_which_could_be_ids_or_escape_the_directory_are_refused() {
-        assert!(hash_key(&site(), "Climate", &[]).is_err());
-        assert!(hash_key(&site(), "climate", &[Part::from("..")]).is_err());
-        assert!(hash_key(&site(), "climate", &[Part::from("a/b")]).is_err());
-        assert!(hash_key(&site(), "climate", &[Part::Name("a".repeat(43))]).is_err());
-        assert!(data_set_dir(Path::new("/root"), &site().to_string()).is_err());
+        assert!(hash_key(&domain(), "Climate", &[]).is_err());
+        assert!(hash_key(&domain(), "climate", &[Part::from("..")]).is_err());
+        assert!(hash_key(&domain(), "climate", &[Part::from("a/b")]).is_err());
+        assert!(hash_key(&domain(), "climate", &[Part::Name("a".repeat(43))]).is_err());
+        assert!(data_set_dir(Path::new("/root"), &domain().to_string()).is_err());
     }
 
     #[test]

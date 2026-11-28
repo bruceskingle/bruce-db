@@ -9,6 +9,20 @@
   `CopyPage::Done` with the cursor to catch up from with the change feed, which brings what changed while it copied.
   A copy which outlasts the journal kept, or is of a store since replaced, answers `CopyPage::Expired`, and is started
   again.
+- **Security Contexts, the first parts,** `security`, see the design's "Security Contexts and Principals": a domain,
+  `Founding`, the root SC, whose ID is made from its founder's first key, which is the store's domain; principals, users
+  and systems, `NewPrincipal`, `PrincipalSecret` and `PrincipalRecord`, each a DataSet of its domain, admitted by an
+  Admin of it, with its keys, `KeyRecord`, each an Ed25519 signing key and an X25519 key exchange key, committing to
+  the next, and valid until its `until`, and what is said of it, `DirectoryRecord`, e.g. its name; SCs, `ScRecord`,
+  joined into a graph by membership, `MemberRecord`, Admin, Write or Read, each change a record of its own, signed by
+  an Admin; delegations, `DelegationRecord`, by which an actor acts for its subject while the subject is away, up to
+  Write; `Security::load`, which works out each principal's role, the best of its paths through the graph, from the
+  store's records, judged in the order they were signed, so that a removal is not undone and two memberships never
+  make each other valid; `sign_request`, `sign_request_for` and `Security::check_request`, for requests signed by
+  their subject and actor, and `Security::role_for`, what such a request may do; and `Security::sees_security_records`
+  and `is_security_data_set`, for a node to give the security records only to those entitled to them. A security
+  record's version is when it was signed. The DataSets of principals and of what is said of them are split on disk by
+  their IDs' first two hex characters.
 - **A gap in the journal kept is found,** e.g. an hour lost from a failing SD card: a peer whose catch-up would cross
   it is told it is too far behind, and copies instead, rather than missing the changes in it without knowing.
 

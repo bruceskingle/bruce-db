@@ -27,10 +27,11 @@ Dependencies' licences
 ----------------------
 
 A dependency of this crate is licensed MIT OR Apache-2.0, or another permissive licence where no such crate does the
-job, and what it pulls in is permissive too: never copyleft. `cargo deny check`, see [deny.toml](deny.toml), checks every
-crate in the build against that, listing by name each one which is not MIT OR Apache-2.0, e.g. `generic-array`, MIT,
-which sha2 pulls in, and `unicode-normalization`, which is also under Unicode-3.0, the Unicode Consortium's MIT-like
-licence for its tables. An app which ships this crate must ship the notices of the crates in it, which cargo-about can collect.
+job, and what it pulls in is permissive too: never copyleft. `cargo deny check`, see [deny.toml](deny.toml), checks
+every crate in the build against that, listing by name each one which is not MIT OR Apache-2.0, e.g. `generic-array`,
+MIT, which sha2 pulls in, and `unicode-normalization`, which is also under Unicode-3.0, the Unicode Consortium's
+MIT-like licence for its tables. An app which ships this crate must ship the notices of the crates in it, which
+cargo-about can collect.
 
 Contribution
 ------------

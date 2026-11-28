@@ -1,6 +1,6 @@
 //! Bruce's Database: a record store with a hash key, a sort key and a version on every record, see docs/design.md.
 //!
-//! A store is opened for a site, by its location, see Store::open, and gives the operations of the Backend, whichever
+//! A store is opened for a domain, by its location, see Store::open, and gives the operations of the Backend, whichever
 //! one it is, so that the code using it never names one.
 
 mod backend;
@@ -8,6 +8,7 @@ mod file;
 mod id;
 mod item;
 mod key;
+pub mod security;
 
 use std::ops::Range;
 use std::path::PathBuf;
@@ -20,46 +21,46 @@ pub use bruce_util_progress as progress;
 pub use file::FileBackend;
 pub use id::{Id, is_id};
 pub use item::{Item, Micros, Version};
-pub use key::{Part, hash_key, is_name, site_of, sort_key_date};
+pub use key::{Part, domain_of, hash_key, is_name, sort_key_date};
 
-/// A site's store, see the crate documentation.
+/// A domain's store, see the crate documentation.
 pub struct Store {
-    site: Id,
+    domain: Id,
     backend: Box<dyn Backend>,
 }
 
 impl Store {
-    /// The store of site at location, e.g. `file:///Users/bruce/Library/…/store`, a directory of sites, the only kind
-    /// of location there is so far.
-    pub fn open(location: &str, site: &Id) -> anyhow::Result<Store> {
+    /// The store of domain at location, e.g. `file:///Users/bruce/Library/…/store`, a directory of domains, the only
+    /// kind of location there is so far.
+    pub fn open(location: &str, domain: &Id) -> anyhow::Result<Store> {
         match location.strip_prefix("file://") {
             Some(path) => Ok(Store {
-                site: site.clone(),
-                backend: Box::new(FileBackend::open(&PathBuf::from(path), site)?),
+                domain: domain.clone(),
+                backend: Box::new(FileBackend::open(&PathBuf::from(path), domain)?),
             }),
             None => bail!("{location} is not a store's location: only file:// is known"),
         }
     }
 
-    /// Copies the site from, at location, as the new site to, every record the same but for its hash key's site, see
-    /// FileBackend::copy_site, e.g. for a copy of a profile.
-    pub fn copy_site(location: &str, from: &Id, to: &Id) -> anyhow::Result<()> {
+    /// Copies the domain from, at location, as the new domain to, every record the same but for its hash key's domain,
+    /// see FileBackend::copy_domain, e.g. for a copy of a profile.
+    pub fn copy_domain(location: &str, from: &Id, to: &Id) -> anyhow::Result<()> {
         match location.strip_prefix("file://") {
-            Some(path) => FileBackend::copy_site(&PathBuf::from(path), from, to),
+            Some(path) => FileBackend::copy_domain(&PathBuf::from(path), from, to),
             None => bail!("{location} is not a store's location: only file:// is known"),
         }
     }
 
-    /// A store of site with backend, e.g. for tests.
-    pub fn with_backend(site: &Id, backend: Box<dyn Backend>) -> Store {
+    /// A store of domain with backend, e.g. for tests.
+    pub fn with_backend(domain: &Id, backend: Box<dyn Backend>) -> Store {
         Store {
-            site: site.clone(),
+            domain: domain.clone(),
             backend,
         }
     }
 
-    pub fn site(&self) -> &Id {
-        &self.site
+    pub fn domain(&self) -> &Id {
+        &self.domain
     }
 
     /// See Backend::store_id.
@@ -67,9 +68,9 @@ impl Store {
         self.backend.store_id()
     }
 
-    /// The hash key of a DataSet of the kind in this store's site, see key::hash_key.
+    /// The hash key of a DataSet of the kind in this store's domain, see key::hash_key.
     pub fn hash_key(&self, kind: &str, parts: &[Part]) -> anyhow::Result<String> {
-        hash_key(&self.site, kind, parts)
+        hash_key(&self.domain, kind, parts)
     }
 
     pub fn put(&self, item: &Item) -> anyhow::Result<Put> {

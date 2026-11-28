@@ -215,8 +215,8 @@ pub(crate) fn check(text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The CRC32 (IEEE, as zip's and Ethernet's) of parts, one after another, a byte at a time with CRC_TABLE, as every line
-/// read is checked, which a bit at a time made a noticeable part of reading a day of the Home Mini's readings.
+/// The CRC32 (IEEE, as zip's and Ethernet's) of parts, one after another, a byte at a time with CRC_TABLE, as every
+/// line read is checked, which a bit at a time made a noticeable part of reading a day of the Home Mini's readings.
 fn crc32(parts: &[&[u8]]) -> u32 {
     let mut crc = !0u32;
     for byte in parts.iter().flat_map(|part| part.iter()) {
@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn a_sealed_line_is_checked_and_one_changed_is_refused() {
         let item = Item {
-            hk: "site/tesla.snapshot/gw".to_string(),
+            hk: "domain/tesla.snapshot/gw".to_string(),
             sk: "2026-11-23T04:42:10Z".to_string(),
             version: Version::new(Micros(1), "dev"),
             attributes: Some(serde_json::json!({"power": 1234})),

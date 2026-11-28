@@ -42,8 +42,8 @@ impl NextCursor for Feed {
     }
 }
 
-fn site() -> Id {
-    Id::of(&json!({"site": "test"})).unwrap()
+fn domain() -> Id {
+    Id::of(&json!({"domain": "test"})).unwrap()
 }
 
 fn version(seconds: i64, origin: &str) -> Version {
@@ -51,7 +51,7 @@ fn version(seconds: i64, origin: &str) -> Version {
 }
 
 fn open(dir: &TestDir) -> Store {
-    Store::open(&dir.location(), &site()).unwrap()
+    Store::open(&dir.location(), &domain()).unwrap()
 }
 
 #[test]
@@ -186,7 +186,7 @@ fn a_query_finds_a_range_in_order_from_the_journal_and_compacted_files_alike() {
     let tomorrow = Micros::now().date().unwrap().next_day().unwrap();
     store.compact(tomorrow).unwrap();
     assert!(
-        std::fs::read_dir(dir.0.join(site().hex()).join("journal"))
+        std::fs::read_dir(dir.0.join(domain().hex()).join("journal"))
             .unwrap()
             .flatten()
             .all(|entry| !entry.file_name().to_string_lossy().ends_with(".jsonl"))
@@ -194,13 +194,13 @@ fn a_query_finds_a_range_in_order_from_the_journal_and_compacted_files_alike() {
     assert_eq!(values(&store, "2026-11-04".."2026-11-05"), vec![2, 3]);
     assert!(
         dir.0
-            .join(site().hex())
+            .join(domain().hex())
             .join("tesla.snapshot/gw/2026/11/04.jsonl")
             .exists()
     );
     assert!(
         dir.0
-            .join(site().hex())
+            .join(domain().hex())
             .join("tesla.snapshot/gw/records.jsonl")
             .exists()
     );
@@ -351,14 +351,14 @@ fn data_sets_are_listed_by_prefix_with_their_ids() {
         ))
         .unwrap();
     assert_eq!(
-        store.data_sets(&format!("{}/octopus.", site())).unwrap(),
+        store.data_sets(&format!("{}/octopus.", domain())).unwrap(),
         vec![readings.clone()]
     );
     store
         .compact(Micros::now().date().unwrap().next_day().unwrap())
         .unwrap();
     assert_eq!(
-        store.data_sets(&format!("{}/", site())).unwrap(),
+        store.data_sets(&format!("{}/", domain())).unwrap(),
         vec![climate, readings]
     );
 }
@@ -378,13 +378,13 @@ fn a_blob_is_kept_by_the_hash_of_its_bytes() {
 fn a_record_of_another_site_or_a_bad_hash_key_is_refused() {
     let dir = TestDir::new("refused");
     let store = open(&dir);
-    let other = Id::of(&json!({"site": "other"})).unwrap();
+    let other = Id::of(&json!({"domain": "other"})).unwrap();
     let hk = hash_key(&other, "climate.period", &[]).unwrap();
     assert!(store.put(&Item::new(&hk, "-", version(1, "app"), json!({}))).is_err());
     assert!(
         store
             .put(&Item::new(
-                &format!("{}/Bad Kind", site()),
+                &format!("{}/Bad Kind", domain()),
                 "-",
                 version(1, "app"),
                 json!({})
@@ -479,7 +479,7 @@ fn a_cancelled_compaction_loses_nothing_and_can_be_done_again() {
 
 #[test]
 fn a_copied_site_has_the_same_records_under_its_own_hash_keys() {
-    let dir = TestDir::new("copy-site");
+    let dir = TestDir::new("copy-domain");
     let store = open(&dir);
     let hk = store.hash_key("climate.period", &[Part::from("dev1")]).unwrap();
     store
@@ -503,8 +503,8 @@ fn a_copied_site_has_the_same_records_under_its_own_hash_keys() {
         .unwrap();
     let blob = store.put_blob(b"a bill").unwrap();
 
-    let copy = Id::of(&json!({"site": "copy"})).unwrap();
-    Store::copy_site(&dir.location(), &site(), &copy).unwrap();
+    let copy = Id::of(&json!({"domain": "copy"})).unwrap();
+    Store::copy_domain(&dir.location(), &domain(), &copy).unwrap();
     let copied = Store::open(&dir.location(), &copy).unwrap();
     let copied_hk = copied.hash_key("climate.period", &[Part::from("dev1")]).unwrap();
     assert_eq!(
@@ -514,8 +514,8 @@ fn a_copied_site_has_the_same_records_under_its_own_hash_keys() {
     );
     assert_eq!(copied.get_blob(&blob).unwrap().as_deref(), Some(&b"a bill"[..]));
     assert!(
-        Store::copy_site(&dir.location(), &site(), &copy).is_err(),
-        "not over a site which is there"
+        Store::copy_domain(&dir.location(), &domain(), &copy).is_err(),
+        "not over a domain which is there"
     );
     assert_eq!(store.all(&hk).unwrap().len(), 2, "the original is as it was");
 }
@@ -621,8 +621,8 @@ fn a_store_keeps_its_id_and_a_copy_has_its_own() {
     let id = open(&dir).store_id();
     assert!(is_id(&id));
     assert_eq!(open(&dir).store_id(), id, "kept when opened again");
-    let copy = Id::of(&json!({"site": "copy"})).unwrap();
-    Store::copy_site(&dir.location(), &site(), &copy).unwrap();
+    let copy = Id::of(&json!({"domain": "copy"})).unwrap();
+    Store::copy_domain(&dir.location(), &domain(), &copy).unwrap();
     let copied = Store::open(&dir.location(), &copy).unwrap().store_id();
     assert!(is_id(&copied));
     assert_ne!(copied, id);
@@ -676,7 +676,7 @@ fn a_garbled_line_is_skipped_and_the_rest_of_the_store_still_works() {
                 .unwrap();
         }
     }
-    let journal = std::fs::read_dir(dir.0.join(site().hex()).join("journal"))
+    let journal = std::fs::read_dir(dir.0.join(domain().hex()).join("journal"))
         .unwrap()
         .flatten()
         .find(|entry| entry.file_name().to_string_lossy().ends_with(".jsonl"))
@@ -684,8 +684,8 @@ fn a_garbled_line_is_skipped_and_the_rest_of_the_store_still_works() {
         .path();
     let text = std::fs::read(&journal).unwrap();
     let mut lines: Vec<Vec<u8>> = text.split(|byte| *byte == b'\n').map(<[u8]>::to_vec).collect();
-    // The second record's top bits flipped in its middle, so that it is not UTF-8, and the third's quotes, so that it is
-    // not JSON.
+    // The second record's top bits flipped in its middle, so that it is not UTF-8, and the third's quotes, so that it
+    // is not JSON.
     for byte in &mut lines[1][20..40] {
         *byte |= 0x80;
     }
@@ -758,8 +758,8 @@ fn the_journal_is_kept_by_the_hour_and_a_peer_behind_catches_up_from_the_hours_k
             .put(&Item::new(&hk, &sk, version(index + 1, "dev"), json!({"value": index})))
             .unwrap();
     }
-    let site_dir = dir.0.join(site().hex());
-    let journal: Vec<String> = std::fs::read_dir(site_dir.join("journal"))
+    let domain_dir = dir.0.join(domain().hex());
+    let journal: Vec<String> = std::fs::read_dir(domain_dir.join("journal"))
         .unwrap()
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().to_string())
@@ -773,14 +773,14 @@ fn the_journal_is_kept_by_the_hour_and_a_peer_behind_catches_up_from_the_hours_k
         journal[0]
     );
     assert_eq!(
-        std::fs::read_to_string(site_dir.join("format.json")).unwrap(),
+        std::fs::read_to_string(domain_dir.join("format.json")).unwrap(),
         r#"{"format":2}"#
     );
 
     // Compacting the hours which have ended, as of an hour from now, folds it, and keeps it.
     store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
-    assert!(!site_dir.join("journal").join(&journal[0]).exists());
-    assert!(site_dir.join("journal/kept").join(&journal[0]).exists());
+    assert!(!domain_dir.join("journal").join(&journal[0]).exists());
+    assert!(domain_dir.join("journal/kept").join(&journal[0]).exists());
     assert_eq!(store.all(&hk).unwrap().len(), 6);
 
     // A peer behind reads the kept hour, a page at a time, in order.
@@ -811,7 +811,7 @@ fn the_journal_is_kept_by_the_hour_and_a_peer_behind_catches_up_from_the_hours_k
 
     // Once the kept hours have gone, after the retention, a peer behind them is too far behind, and copies instead, see
     // a_peer_too_far_behind_copies_the_store_a_page_at_a_time_then_catches_up; one which has everything is not.
-    std::fs::remove_dir_all(site_dir.join("journal/kept")).unwrap();
+    std::fs::remove_dir_all(domain_dir.join("journal/kept")).unwrap();
     let feed = store.changes(Cursor(4), 4, None, &mut |_| Ok(())).unwrap();
     assert_eq!(feed, Feed::TooFarBehind);
     assert_eq!(sequences(&store, 7, 4), (vec![], 7));
@@ -863,8 +863,8 @@ fn a_peer_too_far_behind_copies_the_store_a_page_at_a_time_then_catches_up() {
     store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
     // Put after compaction, so still in the journal when the copy starts.
     put(&store, &tesla, "2026-11-04T00:00:00Z");
-    let site_dir = dir.0.join(site().hex());
-    std::fs::remove_dir_all(site_dir.join("journal/kept")).unwrap();
+    let domain_dir = dir.0.join(domain().hex());
+    std::fs::remove_dir_all(domain_dir.join("journal/kept")).unwrap();
     assert_eq!(
         store.changes(Cursor::START, 10, None, &mut |_| Ok(())).unwrap(),
         Feed::TooFarBehind
@@ -970,7 +970,7 @@ fn a_copy_leaves_out_the_peers_own_and_expires_when_the_journal_kept_has_moved_p
         .put(&Item::new(&hk, "2026-11-02T00:00:00Z", version(9, "dev"), json!({})))
         .unwrap();
     store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
-    std::fs::remove_dir_all(dir.0.join(site().hex()).join("journal/kept")).unwrap();
+    std::fs::remove_dir_all(dir.0.join(domain().hex()).join("journal/kept")).unwrap();
     assert_eq!(
         store.copy(Some(&token), 1, None, &mut |_| Ok(())).unwrap(),
         CopyPage::Expired
@@ -1018,7 +1018,7 @@ fn an_hour_missing_from_the_kept_journal_is_a_gap_which_no_peer_catches_up_acros
     put(10);
 
     // The kept hour, holding 1 to 9, split into three hours of three, as if kept over three hours.
-    let kept = dir.0.join(site().hex()).join("journal/kept");
+    let kept = dir.0.join(domain().hex()).join("journal/kept");
     let names: Vec<_> = std::fs::read_dir(&kept)
         .unwrap()
         .flatten()
@@ -1070,8 +1070,8 @@ fn a_store_with_a_journal_a_day_is_read_and_compacted_as_it_is() {
             ))
             .unwrap();
     }
-    let site_dir = dir.0.join(site().hex());
-    let journal = site_dir.join("journal");
+    let domain_dir = dir.0.join(domain().hex());
+    let journal = domain_dir.join("journal");
     let hour = std::fs::read_dir(&journal)
         .unwrap()
         .flatten()
@@ -1079,10 +1079,10 @@ fn a_store_with_a_journal_a_day_is_read_and_compacted_as_it_is() {
         .unwrap()
         .path();
     std::fs::rename(&hour, journal.join("2026-11-22.jsonl")).unwrap();
-    std::fs::remove_file(site_dir.join("format.json")).unwrap();
+    std::fs::remove_file(domain_dir.join("format.json")).unwrap();
 
     let store = open(&dir);
-    assert!(site_dir.join("format.json").exists());
+    assert!(domain_dir.join("format.json").exists());
     assert_eq!(store.all(&hk).unwrap().len(), 1);
     store
         .put(&Item::new(
@@ -1093,6 +1093,8 @@ fn a_store_with_a_journal_a_day_is_read_and_compacted_as_it_is() {
         ))
         .unwrap();
     assert_eq!(sequences(&store, 0, 10), (vec![1, 2], 2));
+    // Kept for longer than the default, so that the day of 22 November is kept whenever the test runs.
+    store.set_retention(std::time::Duration::from_secs(10 * 365 * 24 * 3600));
     store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
     assert!(!journal.join("2026-11-22.jsonl").exists());
     assert!(journal.join("kept/2026-11-22.jsonl").exists());
@@ -1130,7 +1132,7 @@ fn a_series_is_appended_to_and_queried_from_the_middle_of_its_day() {
         put(index, 0);
     }
     store.compact_through(later()).unwrap();
-    let file = dir.0.join(site().hex()).join("tesla.snapshot/gw/2026/11/23.jsonl");
+    let file = dir.0.join(domain().hex()).join("tesla.snapshot/gw/2026/11/23.jsonl");
     let first_length = std::fs::metadata(&file).unwrap().len();
     for index in 1000..2000 {
         put(index, 0);
@@ -1300,8 +1302,8 @@ fn a_record_damaged_on_the_card_is_replaced_by_the_same_record_from_a_peer() {
         }
         item = store.get(&hk, "2026-11-01T00:00:02Z").unwrap().unwrap();
         store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
-        let site_dir = dir.0.join(site().hex());
-        file = walk(&site_dir)
+        let domain_dir = dir.0.join(domain().hex());
+        file = walk(&domain_dir)
             .into_iter()
             .find(|path| {
                 path.extension().is_some_and(|extension| extension == "jsonl")
@@ -1351,8 +1353,8 @@ fn a_record_damaged_while_the_store_is_open_is_missing_and_replaced_by_a_peers_c
     let items: Vec<Item> = (1..=3).map(put).collect();
     store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
     assert_eq!(store.get(&hk, &items[1].sk).unwrap(), Some(items[1].clone()));
-    let site_dir = dir.0.join(site().hex());
-    let file = walk(&site_dir)
+    let domain_dir = dir.0.join(domain().hex());
+    let file = walk(&domain_dir)
         .into_iter()
         .find(|path| {
             path.extension().is_some_and(|extension| extension == "jsonl")
@@ -1382,7 +1384,7 @@ fn a_record_damaged_while_the_store_is_open_is_missing_and_replaced_by_a_peers_c
 
     // In the journal: a record put since, then damaged, which compaction leaves out, and a peer's copy restores.
     let fourth = put(4);
-    let journal = walk(&site_dir.join("journal"))
+    let journal = walk(&domain_dir.join("journal"))
         .into_iter()
         .find(|path| !path.to_string_lossy().contains("kept") && path.to_string_lossy().ends_with(".jsonl"))
         .unwrap();
@@ -1397,7 +1399,7 @@ fn a_record_damaged_while_the_store_is_open_is_missing_and_replaced_by_a_peers_c
 
     // A journal line damaged with no copy sent: compaction goes on without it, and a copy sent later is stored.
     let fifth = put(5);
-    let journal = walk(&site_dir.join("journal"))
+    let journal = walk(&domain_dir.join("journal"))
         .into_iter()
         .find(|path| !path.to_string_lossy().contains("kept") && path.to_string_lossy().ends_with(".jsonl"))
         .unwrap();
@@ -1421,4 +1423,519 @@ fn walk(dir: &std::path::Path) -> Vec<PathBuf> {
         }
     }
     found
+}
+
+/// A domain's Security Contexts, as the design's example: the domain, whose Admins are the co-owners, an SC for the
+/// app under it, and under that `control`, for the admins, and `data`, for the devices and the readers, each with its
+/// parent as an Admin member.
+struct TestDomain {
+    store: Store,
+    owner: security::PrincipalSecret,
+    wife: security::PrincipalSecret,
+    admin: security::PrincipalSecret,
+    device: security::PrincipalSecret,
+    reader: security::PrincipalSecret,
+    domain: Id,
+    app: Id,
+    control: Id,
+    data: Id,
+    admin_member: security::MemberRecord,
+}
+
+fn put_record(store: &Store, item: anyhow::Result<Item>) {
+    store.put(&item.unwrap()).unwrap();
+}
+
+/// A moment, so that records made one after another are signed at different times.
+fn tick() {
+    std::thread::sleep(std::time::Duration::from_millis(2));
+}
+
+/// Puts a new principal's records in store, admitted by by, and returns its secret.
+fn admit(store: &Store, kind: &str, by: &security::PrincipalSecret) -> security::PrincipalSecret {
+    let new = security::NewPrincipal::new(store.domain(), kind).unwrap();
+    tick();
+    for item in new.record.admitted_by(by).unwrap().items(store, "test").unwrap() {
+        store.put(&item).unwrap();
+    }
+    put_record(store, new.key.item(store, "test"));
+    new.secret
+}
+
+fn test_domain(dir: &TestDir) -> TestDomain {
+    use security::*;
+    let founding = Founding::new("Bruce's home").unwrap();
+    let domain = Id::parse(&founding.domain.id).unwrap();
+    let store = Store::open(&dir.location(), &domain).unwrap();
+    let owner = founding.founder.secret.clone();
+    for item in founding.founder.record.items(&store, "test").unwrap() {
+        store.put(&item).unwrap();
+    }
+    put_record(&store, founding.founder.key.item(&store, "test"));
+    put_record(&store, founding.domain.item(&store, "test"));
+    let member = |store: &Store, sc: &Id, member: &Id, role: Role| {
+        tick();
+        let record = MemberRecord::new(sc, member, role, &owner).unwrap();
+        put_record(store, record.item(store, "test"));
+        record
+    };
+    member(&store, &domain, owner.id(), Role::Admin);
+    let wife = admit(&store, USER, &owner);
+    let admin = admit(&store, USER, &owner);
+    let device = admit(&store, SYSTEM, &owner);
+    let reader = admit(&store, USER, &owner);
+    let (_, app) = ScRecord::new("bruce-smart-home", &owner).unwrap();
+    let (_, control) = ScRecord::new("control", &owner).unwrap();
+    let (_, data) = ScRecord::new("data", &owner).unwrap();
+    let (app_id, control_id, data_id) = (
+        Id::parse(&app.id).unwrap(),
+        Id::parse(&control.id).unwrap(),
+        Id::parse(&data.id).unwrap(),
+    );
+    for sc in [&app, &control, &data] {
+        put_record(&store, sc.item(&store, "test"));
+    }
+    member(&store, &app_id, &domain, Role::Admin);
+    member(&store, &control_id, &app_id, Role::Admin);
+    member(&store, &data_id, &app_id, Role::Admin);
+    member(&store, &domain, wife.id(), Role::Admin);
+    let admin_member = member(&store, &control_id, admin.id(), Role::Write);
+    member(&store, &data_id, device.id(), Role::Write);
+    member(&store, &data_id, reader.id(), Role::Read);
+    TestDomain {
+        store,
+        owner,
+        wife,
+        admin,
+        device,
+        reader,
+        domain,
+        app: app_id,
+        control: control_id,
+        data: data_id,
+        admin_member,
+    }
+}
+
+/// Who may do what is worked out from the domain's signed records: each role where it was given, and, through the
+/// graph of SCs, the co-owners' Admin everywhere, two levels deep.
+#[test]
+fn a_domains_security_contexts_give_each_principal_its_role_and_the_co_owners_all() {
+    use security::*;
+    let dir = TestDir::new("security-roles");
+    let domain = test_domain(&dir);
+    let store = &domain.store;
+    let security = Security::load(store).unwrap();
+    for owner in [&domain.owner, &domain.wife] {
+        for sc in [&domain.domain, &domain.app, &domain.control, &domain.data] {
+            assert_eq!(security.role(owner.id(), sc), Some(Role::Admin));
+        }
+    }
+    assert_eq!(security.role(domain.admin.id(), &domain.control), Some(Role::Write));
+    assert_eq!(security.role(domain.admin.id(), &domain.data), None);
+    assert_eq!(security.role(domain.admin.id(), &domain.domain), None);
+    assert_eq!(security.role(domain.device.id(), &domain.data), Some(Role::Write));
+    assert_eq!(security.role(domain.device.id(), &domain.control), None);
+    assert_eq!(security.role(domain.reader.id(), &domain.data), Some(Role::Read));
+    assert!(security.allows(domain.reader.id(), &domain.data, Role::Read));
+    assert!(!security.allows(domain.reader.id(), &domain.data, Role::Write));
+    assert_eq!(
+        security.sc_path(&["bruce-smart-home", "data"]).map(|sc| sc.id.clone()),
+        Some(domain.data.to_string())
+    );
+    assert_eq!(security.domain().hash.as_deref(), Some(security::HASH));
+    assert_eq!(security.principals().count(), 5);
+
+    // A member record signed by someone who is not an Admin of its SC, a device, or an admin of control, does not
+    // count.
+    let intruder = admit(store, SYSTEM, &domain.owner);
+    put_record(
+        store,
+        MemberRecord::new(&domain.data, intruder.id(), Role::Write, &domain.device).and_then(|m| m.item(store, "t")),
+    );
+    put_record(
+        store,
+        MemberRecord::new(&domain.domain, intruder.id(), Role::Admin, &domain.admin).and_then(|m| m.item(store, "t")),
+    );
+    // Nor does a principal admitted by someone who is not an Admin of the domain, nor one admitting itself.
+    let stranger = NewPrincipal::new(store.domain(), USER).unwrap();
+    for item in stranger.record.items(store, "test").unwrap() {
+        store.put(&item).unwrap();
+    }
+    put_record(store, stranger.key.item(store, "test"));
+    let unadmitted = NewPrincipal::new(store.domain(), USER).unwrap();
+    for item in unadmitted
+        .record
+        .admitted_by(&domain.admin)
+        .unwrap()
+        .items(store, "test")
+        .unwrap()
+    {
+        store.put(&item).unwrap();
+    }
+    let security = Security::load(store).unwrap();
+    assert_eq!(security.role(intruder.id(), &domain.data), None);
+    assert_eq!(security.role(intruder.id(), &domain.domain), None);
+    assert!(security.principal(stranger.secret.id()).is_none());
+    assert!(security.principal(unadmitted.secret.id()).is_none());
+    assert!(security.principal(intruder.id()).is_some());
+}
+
+/// A domain's ID is its founder's: another store claiming it, or a domain record changed by someone else, is refused.
+#[test]
+fn a_domain_is_its_founders() {
+    use security::*;
+    let dir = TestDir::new("security-domain");
+    let domain = test_domain(&dir);
+    let store = &domain.store;
+    // Another founding's record, put as this domain's, does not have this domain's ID.
+    let other = Founding::new("Not Bruce's").unwrap();
+    let mut claimed = other.domain.clone();
+    claimed.id = domain.domain.to_string();
+    put_record(store, claimed.item(store, "test"));
+    assert!(Security::load(store).is_err());
+
+    // An Admin may change the domain's record; a writer may not.
+    let dir = TestDir::new("security-domain-2");
+    let domain = test_domain(&dir);
+    let store = &domain.store;
+    let mut record = Security::load(store).unwrap().domain().clone();
+    record.default = Some(domain.data.to_string());
+    record.sign(&domain.wife).unwrap();
+    put_record(store, record.item(store, "test"));
+    assert_eq!(
+        Security::load(store).unwrap().domain().default.as_deref(),
+        Some(domain.data.as_str())
+    );
+    tick();
+    record.sign(&domain.admin).unwrap();
+    put_record(store, record.item(store, "test"));
+    assert!(Security::load(store).is_err());
+}
+
+/// Co-owners are equals, so either removes the other, the domain's founder too; what a removed Admin signed before
+/// still counts, and what it signs after does not. A removal is not undone by putting the record from before it again,
+/// nor by a removed Admin removing the one who removed it, as the records are judged in the order they were signed.
+#[test]
+fn members_are_removed_by_an_admin_and_a_removal_is_not_undone() {
+    use security::*;
+    let dir = TestDir::new("security-removal");
+    let domain = test_domain(&dir);
+    let store = &domain.store;
+
+    // The wife, a co-owner, adds a reader, then removes the owner, who founded the domain.
+    let reader2 = admit(store, USER, &domain.wife);
+    tick();
+    put_record(
+        store,
+        MemberRecord::new(&domain.data, reader2.id(), Role::Read, &domain.wife).and_then(|m| m.item(store, "t")),
+    );
+    tick();
+    let owner_member = MemberRecord::new(&domain.domain, domain.owner.id(), Role::Admin, &domain.wife).unwrap();
+    tick();
+    put_record(
+        store,
+        owner_member.removed_by(&domain.wife).and_then(|m| m.item(store, "t")),
+    );
+    let security = Security::load(store).unwrap();
+    assert_eq!(security.role(domain.owner.id(), &domain.domain), None);
+    assert_eq!(security.role(domain.owner.id(), &domain.data), None);
+    assert_eq!(security.role(reader2.id(), &domain.data), Some(Role::Read));
+    // What the owner signed while it was an Admin still counts.
+    assert_eq!(security.role(domain.device.id(), &domain.data), Some(Role::Write));
+    assert_eq!(security.role(domain.admin.id(), &domain.control), Some(Role::Write));
+
+    // What the owner signs now does not: a member, nor removing the wife back.
+    tick();
+    let late = admit(store, USER, &domain.wife);
+    tick();
+    put_record(
+        store,
+        MemberRecord::new(&domain.data, late.id(), Role::Read, &domain.owner).and_then(|m| m.item(store, "t")),
+    );
+    let wife_member = MemberRecord::new(&domain.domain, domain.wife.id(), Role::Admin, &domain.owner).unwrap();
+    tick();
+    put_record(
+        store,
+        wife_member.removed_by(&domain.owner).and_then(|m| m.item(store, "t")),
+    );
+    let security = Security::load(store).unwrap();
+    assert_eq!(security.role(late.id(), &domain.data), None);
+    assert_eq!(security.role(domain.wife.id(), &domain.domain), Some(Role::Admin));
+
+    // The wife removes the admin; the record from before, put again, as a stolen node could, changes nothing, as it is
+    // the same record, at the same time.
+    tick();
+    put_record(
+        store,
+        domain
+            .admin_member
+            .removed_by(&domain.wife)
+            .and_then(|m| m.item(store, "t")),
+    );
+    let security = Security::load(store).unwrap();
+    assert_eq!(security.role(domain.admin.id(), &domain.control), None);
+    put_record(store, domain.admin_member.item(store, "stolen"));
+    let security = Security::load(store).unwrap();
+    assert_eq!(security.role(domain.admin.id(), &domain.control), None);
+}
+
+/// SCs form a graph: an SC with two parents gives each's members a way in, and a loop of SCs neither stops roles being
+/// worked out nor makes two memberships valid by each other.
+#[test]
+fn the_sc_graph_has_several_parents_and_loops() {
+    use security::*;
+    let dir = TestDir::new("security-graph");
+    let domain = test_domain(&dir);
+    let store = &domain.store;
+    // A shared SC made by the owner under data, with control as a Read parent too.
+    let (_, shared) = ScRecord::new("shared", &domain.owner).unwrap();
+    let shared_id = Id::parse(&shared.id).unwrap();
+    put_record(store, shared.item(store, "t"));
+    tick();
+    put_record(
+        store,
+        MemberRecord::new(&shared_id, &domain.data, Role::Admin, &domain.owner).and_then(|m| m.item(store, "t")),
+    );
+    tick();
+    put_record(
+        store,
+        MemberRecord::new(&shared_id, &domain.control, Role::Read, &domain.owner).and_then(|m| m.item(store, "t")),
+    );
+    // A loop: data a Read member of control, as control is, through the app, Admin of data.
+    tick();
+    put_record(
+        store,
+        MemberRecord::new(&domain.control, &domain.data, Role::Read, &domain.owner).and_then(|m| m.item(store, "t")),
+    );
+    let security = Security::load(store).unwrap();
+    // The reader reads shared through data; the admin, Write in control, only reads it, through control's Read.
+    assert_eq!(security.role(domain.reader.id(), &shared_id), Some(Role::Read));
+    assert_eq!(security.role(domain.admin.id(), &shared_id), Some(Role::Read));
+    // Round the loop, data's device reads control, and nothing more.
+    assert_eq!(security.role(domain.device.id(), &domain.control), Some(Role::Read));
+    assert_eq!(security.role(domain.owner.id(), &shared_id), Some(Role::Admin));
+
+    // Two memberships which only an Admin through each other could sign do not count: the device, Write in data, makes
+    // a new SC, then makes data its Admin, and claims Admin of the domain through it; it never was one.
+    let (_, own) = ScRecord::new("own", &domain.device).unwrap();
+    let own_id = Id::parse(&own.id).unwrap();
+    put_record(store, own.item(store, "t"));
+    tick();
+    put_record(
+        store,
+        MemberRecord::new(&domain.domain, &own_id, Role::Admin, &domain.device).and_then(|m| m.item(store, "t")),
+    );
+    let security = Security::load(store).unwrap();
+    assert_eq!(security.role(domain.device.id(), &domain.domain), None);
+    assert_eq!(security.role(domain.device.id(), &own_id), Some(Role::Admin));
+}
+
+/// A request signed by a principal is taken as its only for the method, URI, body and time it was signed for, within
+/// the window, and only from a principal the domain knows; a principal's record altered after it was signed is
+/// ignored; the secrets kept as text sign as before; and names are what the principals were called.
+#[test]
+fn signed_requests_and_records_are_checked() {
+    use security::*;
+    let dir = TestDir::new("security-requests");
+    let domain = test_domain(&dir);
+    let store = &domain.store;
+    put_record(
+        store,
+        DirectoryRecord::name(domain.device.id(), &domain.domain, "Guitron", &domain.owner)
+            .and_then(|d| d.item(store, "t")),
+    );
+    put_record(
+        store,
+        DirectoryRecord::name(domain.reader.id(), &domain.domain, "Jeff", &domain.reader)
+            .and_then(|d| d.item(store, "t")),
+    );
+    let security = Security::load(store).unwrap();
+    assert_eq!(security.display_name(domain.device.id()), Some("Guitron"));
+    assert_eq!(security.display_name(domain.reader.id()), Some("Jeff"));
+    let now = 1_795_000_000;
+    let uri = "/api/store/changes?since=0&limit=500";
+    let header = sign_request(&domain.device, "GET", uri, b"", now);
+    assert_eq!(
+        security
+            .check_request(Some(&header), "GET", uri, b"", now + 10)
+            .unwrap(),
+        Requester {
+            subject: domain.device.id().clone(),
+            actor: domain.device.id().clone(),
+            delegated: false
+        }
+    );
+    assert!(
+        security
+            .check_request(Some(&header), "GET", "/api/config", b"", now)
+            .is_err()
+    );
+    assert!(security.check_request(Some(&header), "POST", uri, b"{}", now).is_err());
+    assert!(
+        security
+            .check_request(Some(&header), "GET", uri, b"", now + REQUEST_WINDOW + 1)
+            .is_err()
+    );
+    assert!(security.check_request(None, "GET", uri, b"", now).is_err());
+    let stranger = NewPrincipal::new(store.domain(), SYSTEM).unwrap();
+    let header = sign_request(&stranger.secret, "GET", uri, b"", now);
+    assert!(security.check_request(Some(&header), "GET", uri, b"", now).is_err());
+
+    // Kept as text and read back, a secret signs as the principal it is.
+    let kept = PrincipalSecret::from_text(&domain.reader.to_text()).unwrap();
+    let header = sign_request(&kept, "GET", uri, b"", now);
+    assert_eq!(
+        security
+            .check_request(Some(&header), "GET", uri, b"", now)
+            .unwrap()
+            .subject,
+        domain.reader.id().clone()
+    );
+    assert!(!format!("{kept:?}").contains(&kept.to_text()));
+    let (sc_secret, _) = ScRecord::new("other", &domain.owner).unwrap();
+    assert_eq!(
+        ScSecret::from_text(&sc_secret.to_text()).unwrap().to_text(),
+        sc_secret.to_text()
+    );
+
+    // A principal's record given another kind without being signed again does not count.
+    let hk = PrincipalRecord::hash_key(store, domain.reader.id()).unwrap();
+    let mut record: PrincipalRecord =
+        serde_json::from_value(store.get(&hk, RECORD_SK).unwrap().unwrap().attributes.unwrap()).unwrap();
+    record.kind = SYSTEM.to_string();
+    tick();
+    record.at = Micros::now().to_text();
+    for item in record.items(store, "test").unwrap() {
+        store.put(&item).unwrap();
+    }
+    let security = Security::load(store).unwrap();
+    assert!(security.principal(domain.reader.id()).is_none());
+    assert_eq!(security.role(domain.reader.id(), &domain.data), None);
+}
+
+/// A user present signs with their app as actor, and the user's authority is used; while they are away, their app acts
+/// for them by a delegation, up to its role and theirs, never Admin; ending it stops the app, and the record from
+/// before, put again, does not undo it, as it is older.
+#[test]
+fn an_actor_acts_for_its_subject_present_or_by_delegation() {
+    use security::*;
+    let dir = TestDir::new("security-actors");
+    let domain = test_domain(&dir);
+    let store = &domain.store;
+    let app = admit(store, SYSTEM, &domain.owner);
+    let now = Micros::now().0 / 1_000_000;
+    let uri = "/api/config";
+
+    // Present: the owner signs, and the app, which has no role of its own, signs as actor.
+    let security = Security::load(store).unwrap();
+    let header = sign_request_for(Subject::Present(&domain.owner), &app, "POST", uri, b"{}", now);
+    let requester = security.check_request(Some(&header), "POST", uri, b"{}", now).unwrap();
+    assert_eq!(requester.subject, *domain.owner.id());
+    assert_eq!(requester.actor, *app.id());
+    assert!(!requester.delegated);
+    assert_eq!(security.role_for(&requester, &domain.domain), Some(Role::Admin));
+    assert!(security.sees_security_records(&requester));
+    // The subject and actor are signed, so neither can be swapped for another.
+    let swapped = header.replace(app.id().as_str(), domain.admin.id().as_str());
+    assert!(security.check_request(Some(&swapped), "POST", uri, b"{}", now).is_err());
+
+    // Away, without a delegation: refused.
+    let away = sign_request_for(Subject::Away(domain.owner.id()), &app, "GET", uri, b"", now);
+    assert!(security.check_request(Some(&away), "GET", uri, b"", now).is_err());
+
+    // With one, up to Write: the owner's Admin is capped at Write, everywhere.
+    assert!(DelegationRecord::new(&domain.owner, app.id(), Role::Admin).is_err());
+    let delegation = DelegationRecord::new(&domain.owner, app.id(), Role::Write).unwrap();
+    put_record(store, delegation.item(store, "test"));
+    let security = Security::load(store).unwrap();
+    let requester = security.check_request(Some(&away), "GET", uri, b"", now).unwrap();
+    assert!(requester.delegated);
+    for sc in [&domain.domain, &domain.control, &domain.data] {
+        assert_eq!(security.role_for(&requester, sc), Some(Role::Write));
+    }
+    assert!(security.sees_security_records(&requester));
+    // A reader's app delegated Write may still only read, and is not given the security records.
+    let jeffs_app = admit(store, SYSTEM, &domain.owner);
+    put_record(
+        store,
+        DelegationRecord::new(&domain.reader, jeffs_app.id(), Role::Write)
+            .unwrap()
+            .item(store, "test"),
+    );
+    // A delegation signed by someone other than its subject does not count.
+    let mut forged = DelegationRecord::new(&domain.admin, jeffs_app.id(), Role::Write).unwrap();
+    forged.subject = domain.wife.id().to_string();
+    put_record(store, forged.item(store, "test"));
+    let security = Security::load(store).unwrap();
+    let jeff = security
+        .check_request(
+            Some(&sign_request_for(
+                Subject::Away(domain.reader.id()),
+                &jeffs_app,
+                "GET",
+                uri,
+                b"",
+                now,
+            )),
+            "GET",
+            uri,
+            b"",
+            now,
+        )
+        .unwrap();
+    assert_eq!(security.role_for(&jeff, &domain.data), Some(Role::Read));
+    assert_eq!(security.role_for(&jeff, &domain.control), None);
+    assert!(!security.sees_security_records(&jeff));
+    assert!(security.delegation(domain.wife.id(), jeffs_app.id()).is_none());
+
+    // Ended, and not undone by the older record put again, as the newer version wins.
+    tick();
+    let ended = delegation.ended_by(&domain.owner).unwrap();
+    put_record(store, ended.item(store, "test"));
+    let security = Security::load(store).unwrap();
+    assert!(security.check_request(Some(&away), "GET", uri, b"", now).is_err());
+    put_record(store, delegation.item(store, "stolen"));
+    let security = Security::load(store).unwrap();
+    assert!(security.check_request(Some(&away), "GET", uri, b"", now).is_err());
+}
+
+/// A principal's first key is the one its ID was made from, and commits to its next; a key stops being valid at its
+/// until; and the principal's DataSets are split by their IDs' first two hex characters on disk.
+#[test]
+fn keys_commit_to_their_next_and_principals_are_split_on_disk() {
+    use security::*;
+    let dir = TestDir::new("security-keys");
+    let domain = test_domain(&dir);
+    let store = &domain.store;
+    let new = NewPrincipal::new(store.domain(), USER).unwrap();
+    assert!(new.record.verify_own().is_ok());
+    assert_eq!(new.key.sign, new.record.first);
+    assert_eq!(new.key.next, new.record.next);
+    assert!(new.key.valid_at(Micros::now()));
+    let mut ended = new.key.clone();
+    let until = Micros::now();
+    ended.until = Some(until.to_text());
+    assert!(ended.valid_at(Micros(until.0 - 1)));
+    assert!(!ended.valid_at(until));
+    // A record claiming another first key is not its ID's.
+    let mut other = new.record.clone();
+    other.first = NewPrincipal::new(store.domain(), USER).unwrap().record.first;
+    assert!(other.check_id().is_err());
+
+    store.sync().unwrap();
+    store.compact_through(Micros(Micros::now().0 + 3_600_000_000)).unwrap();
+    let hex = domain.reader.id().hex();
+    let split = walk(&dir.0).into_iter().any(|path| {
+        path.to_string_lossy()
+            .contains(&format!("principal/{}/{hex}", &hex[..2]))
+    });
+    assert!(
+        split,
+        "the principal's DataSet is not split by its ID's first hex characters"
+    );
+    assert!(is_security_data_set(&PrincipalRecord::list_hash_key(store).unwrap()));
+    assert!(!is_security_data_set(
+        &store.hash_key("sensor.temperature", &[]).unwrap()
+    ));
 }

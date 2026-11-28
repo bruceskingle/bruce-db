@@ -44,8 +44,8 @@ pub enum Feed {
     TooFarBehind,
 }
 
-/// Where a full copy has got to, see Backend::copy: a token the peer keeps between pages and passes back unread, e.g. in
-/// a URL, as it is URL safe text.
+/// Where a full copy has got to, see Backend::copy: a token the peer keeps between pages and passes back unread, e.g.
+/// in a URL, as it is URL safe text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CopyToken(pub String);
 
@@ -98,7 +98,8 @@ impl Change {
 
 pub trait Backend: Send + Sync {
     /// The store's ID, made when it was first made, which a peer keeps with its cursor, see changes, so that it can
-    /// tell when a node's store is a new one, e.g. a device's wiped or changed card, whose sequence numbers start again.
+    /// tell when a node's store is a new one, e.g. a device's wiped or changed card, whose sequence numbers start
+    /// again.
     fn store_id(&self) -> String;
 
     /// Stores item unless a copy as new is stored, saying which happened. from is the peer it was pulled from, None
@@ -135,10 +136,10 @@ pub trait Backend: Send + Sync {
         visit: &mut dyn FnMut(Change) -> anyhow::Result<()>,
     ) -> anyhow::Result<Feed>;
 
-    /// A page of a full copy of the store, for a peer too far behind for the change feed, see Feed::TooFarBehind: up
-    /// to limit of its records, from where token says the last page got to, or from the start if None, leaving out
-    /// those from or originated by for_peer, as changes does. Each record is given as a Change, with the sequence number
-    /// it was stored with, and a peer puts them as it puts changes. See the design's "The journal by the hour".
+    /// A page of a full copy of the store, for a peer too far behind for the change feed, see Feed::TooFarBehind: up to
+    /// limit of its records, from where token says the last page got to, or from the start if None, leaving out those
+    /// from or originated by for_peer, as changes does. Each record is given as a Change, with the sequence number it
+    /// was stored with, and a peer puts them as it puts changes. See the design's "The journal by the hour".
     fn copy(
         &self,
         token: Option<&CopyToken>,
@@ -147,16 +148,16 @@ pub trait Backend: Send + Sync {
         visit: &mut dyn FnMut(Change) -> anyhow::Result<()>,
     ) -> anyhow::Result<CopyPage>;
 
-    /// The hash keys of the DataSets which start with prefix, e.g. every device's `climate.period` of a site.
+    /// The hash keys of the DataSets which start with prefix, e.g. every device's `climate.period` of a domain.
     fn data_sets(&self, prefix: &str) -> anyhow::Result<Vec<String>>;
 
-    /// Folds the journals of the days before before into the DataSets' files, see the design's layout.
-    /// It says how far it is with progress, e.g. "Writing 1200 of 4800 files", as it can take a while after a bulk load,
-    /// and stops if progress is cancelled, between files, returning Cancelled, leaving the journal to compact again.
+    /// Folds the journals of the days before before into the DataSets' files, see the design's layout. It says how far
+    /// it is with progress, e.g. "Writing 1200 of 4800 files", as it can take a while after a bulk load, and stops if
+    /// progress is cancelled, between files, returning Cancelled, leaving the journal to compact again.
     fn compact(&self, before: time::Date, progress: &mut dyn bruce_util_progress::Progress) -> anyhow::Result<()>;
 
-    /// Folds the journal's files of the hours which ended by before, e.g. now, into the DataSets' files, as compact does
-    /// the days, so that the journal stays an hour or two, which is what opening the store reads, see the design's
+    /// Folds the journal's files of the hours which ended by before, e.g. now, into the DataSets' files, as compact
+    /// does the days, so that the journal stays an hour or two, which is what opening the store reads, see the design's
     /// journal by the hour. The hours folded are kept, see set_retention, for peers catching up.
     fn compact_through(
         &self,
